@@ -549,5 +549,196 @@ app.get('/api/inventory/movements', async (req, res) => {
   }
 });
 
+
+// ================= CAFETERÍA =================
+
+// Buscar productos de cafetería por nombre
+app.get('/api/cafe/products', async (req, res) => {
+  const { org_id, q } = req.query;
+  try {
+    const result = await pool.query(
+      `SELECT id, name, description, base_price
+       FROM cafe_products
+       WHERE org_id = $1 AND is_active = TRUE
+         AND ($2::text IS NULL OR name ILIKE $3)
+       ORDER BY name`,
+      [org_id || 2, q || null, q ? `%${q}%` : null]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Obtener modificadores de un producto de cafetería
+app.get('/api/cafe/products/:id/modifiers', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const groups = await pool.query(
+      `SELECT mg.id, mg.name, mg.sort_order, mg.required, mg.multiple
+       FROM cafe_modifier_groups mg
+       JOIN cafe_product_modifiers pm ON pm.group_id = mg.id
+       WHERE pm.cafe_product_id = $1 AND mg.is_active = TRUE
+       ORDER BY pm.sort_order`,
+      [id]
+    );
+
+    const result = await Promise.all(
+      groups.rows.map(async (group) => {
+        const options = await pool.query(
+          `SELECT id, name, price_delta, ingredient_product_id,
+                  ingredient_qty, ingredient_unit, sort_order
+           FROM cafe_modifier_options
+           WHERE group_id = $1 AND is_active = TRUE
+           ORDER BY sort_order`,
+          [group.id]
+        );
+        return { ...group, options: options.rows };
+      })
+    );
+
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Buscar en TODAS las organizaciones (para cobro mixto)
+app.get('/api/search/all', async (req, res) => {
+  const { q } = req.query;
+  if (!q || q.trim().length < 2) return res.json({ products: [], cafe: [] });
+
+  try {
+    // Productos normales de todas las orgs
+    const products = await pool.query(
+      `SELECT id, sku, name, price_with_tax AS price, unit_type,
+              pieces_per_box, org_id
+       FROM v_products_full
+       WHERE is_active = TRUE
+         AND price_with_tax > 0
+         AND (sku ILIKE $1 OR name ILIKE $1)
+       ORDER BY name
+       LIMIT 10`,
+      [`%${q.trim()}%`]
+    );
+
+    // Productos de cafetería
+    const cafe = await pool.query(
+      `SELECT id, name, base_price AS price, org_id,
+              'cafe' AS type
+       FROM cafe_products
+       WHERE is_active = TRUE
+         AND name ILIKE $1
+       ORDER BY name
+       LIMIT 10`,
+      [`%${q.trim()}%`]
+    );
+
+    res.json({
+      products: products.rows,
+      cafe:     cafe.rows,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Registrar venta de cafetería (descuenta ingredientes del inventario)
+app.post('/api/cafe/sales', async (req, res) => {
+  const { org_id, warehouse_id, items, payments, user_id } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const total = items.reduce((acc, item) => {
+      return acc + (item.final_price * item.quantity);
+    }, 0);
+
+    const saleRes = await client.query(
+      `INSERT INTO sales (org_id, warehouse_id, total, created_at)
+       VALUES ($1,$2,$3,NOW()) RETURNING id`,
+      [org_id || 2, warehouse_id || 1, total]
+    );
+    const saleId = saleRes.rows[0].id;
+
+    for (const item of items) {
+      // Obtener receta base
+      const recipe = await client.query(
+        `SELECT ingredient_product_id, quantity, unit
+         FROM cafe_recipes
+         WHERE cafe_product_id = $1`,
+        [item.cafe_product_id]
+      );
+
+      // Modificadores elegidos que sustituyen/agregan ingredientes
+      const modIngredients = (item.selected_options || [])
+        .filter(o => o.ingredient_product_id && o.ingredient_qty > 0);
+
+      // Combinar receta base con modificadores
+      const ingredientMap = {};
+
+      for (const r of recipe.rows) {
+        const key = r.ingredient_product_id;
+        // Si un modificador sustituye este ingrediente, no lo agregamos
+        const isReplaced = modIngredients.some(
+          m => m.replaces_ingredient_id === key
+        );
+        if (!isReplaced) {
+          ingredientMap[key] = (ingredientMap[key] || 0) + Number(r.quantity);
+        }
+      }
+
+      for (const m of modIngredients) {
+        const key = m.ingredient_product_id;
+        ingredientMap[key] = (ingredientMap[key] || 0) + Number(m.ingredient_qty);
+      }
+
+      // Descontar cada ingrediente del inventario
+      for (const [productId, qty] of Object.entries(ingredientMap)) {
+        const invRes = await client.query(
+          `SELECT quantity FROM inventory
+           WHERE org_id=$1 AND warehouse_id=$2 AND product_id=$3`,
+          [org_id || 2, warehouse_id || 1, productId]
+        );
+        const before = parseFloat(invRes.rows[0]?.quantity || 0);
+        const after  = before - (qty * item.quantity);
+
+        await client.query(
+          `INSERT INTO inventory (org_id, warehouse_id, product_id, quantity)
+           VALUES ($1,$2,$3,$4)
+           ON CONFLICT (org_id, warehouse_id, product_id)
+           DO UPDATE SET quantity = $4, last_update = NOW()`,
+          [org_id || 2, warehouse_id || 1, productId, after]
+        );
+
+        await client.query(
+          `INSERT INTO inventory_movements
+           (org_id, warehouse_id, product_id, movement_type, quantity,
+            quantity_before, quantity_after, unit_cost, reference_type, reference_id, user_id)
+           VALUES ($1,$2,$3,'venta',$4,$5,$6,0,'sale',$7,$8)`,
+          [org_id || 2, warehouse_id || 1, productId,
+           qty * item.quantity, before, after, saleId, user_id || null]
+        );
+      }
+    }
+
+    for (const pay of payments) {
+      await client.query(
+        `INSERT INTO sale_payments (sale_id, payment_method_id, amount)
+         VALUES ($1,$2,$3)`,
+        [saleId, pay.payment_method_id, pay.amount]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({ success: true, saleId });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`💻 Server corriendo en puerto ${PORT}`));
