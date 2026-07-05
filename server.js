@@ -670,7 +670,7 @@ app.get('/api/search/all', async (req, res) => {
 
 // Registrar venta de cafetería (descuenta ingredientes del inventario)
 app.post('/api/cafe/sales', async (req, res) => {
-  const { org_id, warehouse_id, items, payments, user_id } = req.body;
+  const { org_id, warehouse_id, items, payments, user_id ,customer_id} = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -679,6 +679,11 @@ app.post('/api/cafe/sales', async (req, res) => {
       return acc + (item.final_price * item.quantity);
     }, 0);
 
+
+    const subtotalVenta = items.reduce(
+      (acc, item) => acc + (parseFloat(item.price) * item.quantity), 0
+    );
+    const totalConIva = subtotalVenta * 1.16;
   
 
     console.log("TOTAL:", total);
