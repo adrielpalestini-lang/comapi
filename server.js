@@ -1057,5 +1057,38 @@ app.post('/api/cash-cuts', async (req, res) => {
   }
 });
 
+
+// Historial de cortes ya realizados
+app.get('/api/cash-cuts', async (req, res) => {
+  const { org_id, page = 1, limit = 15 } = req.query;
+  const offset = (Number(page) - 1) * Number(limit);
+  try {
+    const totalRes = await pool.query(
+      `SELECT COUNT(*) FROM cash_cuts WHERE org_id = $1`,
+      [org_id || 1]
+    );
+    const result = await pool.query(
+      `SELECT cc.id, cc.period_start, cc.period_end, cc.sales_total,
+              cc.counted_cash, cc.expected_cash, cc.difference,
+              cc.payments_breakdown, u.name AS user_name
+       FROM cash_cuts cc
+       LEFT JOIN users u ON u.id = cc.user_id
+       WHERE cc.org_id = $1
+       ORDER BY cc.period_end DESC
+       LIMIT $2 OFFSET $3`,
+      [org_id || 1, limit, offset]
+    );
+    res.json({
+      cuts: result.rows,
+      total: Number(totalRes.rows[0].count),
+      page: Number(page),
+      totalPages: Math.ceil(Number(totalRes.rows[0].count) / Number(limit)),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`💻 Server corriendo en puerto ${PORT}`));
