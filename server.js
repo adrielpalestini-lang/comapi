@@ -691,8 +691,7 @@ app.post('/api/cafe/sales', async (req, res) => {
 
     for (const item of items) {
 
-      console.log("PRODUCT ID:", productId);
-console.log("QTY:", qty);
+
 
 
       const recipe = await client.query(
