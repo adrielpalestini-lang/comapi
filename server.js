@@ -1,3 +1,4 @@
+require('dns').setDefaultResultOrder('ipv4first');
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -17,7 +18,14 @@ const pool = new Pool({
   database: process.env.DB_NAME,
   password: process.env.DB_PASSWORD,
   port: process.env.DB_PORT,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  connectionTimeoutMillis: 5000,
+  idleTimeoutMillis: 30000,
+  max: 10,
+});
+
+pool.on('error', (err) => {
+  console.error('Error inesperado en el pool de Postgres:', err.message);
 });
 
 // ================= HEALTH CHECK =================
@@ -609,7 +617,6 @@ app.get('/api/search/all', async (req, res) => {
   if (!q || q.trim().length < 2) return res.json({ products: [], cafe: [] });
 
   try {
-    // Productos normales de todas las orgs
     const products = await pool.query(
       `SELECT id, sku, name, price_with_tax AS price, unit_type,
               pieces_per_box, org_id
@@ -622,7 +629,6 @@ app.get('/api/search/all', async (req, res) => {
       [`%${q.trim()}%`]
     );
 
-    // Productos de cafetería
     const cafe = await pool.query(
       `SELECT id, name, base_price AS price, org_id,
               'cafe' AS type
@@ -662,7 +668,6 @@ app.post('/api/cafe/sales', async (req, res) => {
     const saleId = saleRes.rows[0].id;
 
     for (const item of items) {
-      // Obtener receta base
       const recipe = await client.query(
         `SELECT ingredient_product_id, quantity, unit
          FROM cafe_recipes
@@ -670,16 +675,13 @@ app.post('/api/cafe/sales', async (req, res) => {
         [item.cafe_product_id]
       );
 
-      // Modificadores elegidos que sustituyen/agregan ingredientes
       const modIngredients = (item.selected_options || [])
         .filter(o => o.ingredient_product_id && o.ingredient_qty > 0);
 
-      // Combinar receta base con modificadores
       const ingredientMap = {};
 
       for (const r of recipe.rows) {
         const key = r.ingredient_product_id;
-        // Si un modificador sustituye este ingrediente, no lo agregamos
         const isReplaced = modIngredients.some(
           m => m.replaces_ingredient_id === key
         );
@@ -693,7 +695,6 @@ app.post('/api/cafe/sales', async (req, res) => {
         ingredientMap[key] = (ingredientMap[key] || 0) + Number(m.ingredient_qty);
       }
 
-      // Descontar cada ingrediente del inventario
       for (const [productId, qty] of Object.entries(ingredientMap)) {
         const invRes = await client.query(
           `SELECT quantity FROM inventory
