@@ -974,19 +974,21 @@ app.put('/api/organizations/:id/loyalty-settings', async (req, res) => {
 
 // Resumen desde el último corte (o desde siempre si no hay ninguno)
 app.get('/api/cash-cuts/summary', async (req, res) => {
-  const { org_id, warehouse_id } = req.query;
+  const { warehouse_id } = req.query;
   try {
+    // Un solo corte por caja física (warehouse), sin importar si la venta
+    // fue de tienda (org 1) o cafetería (org 2) — es el mismo cajón.
     const lastCut = await pool.query(
-      `SELECT period_end FROM cash_cuts WHERE org_id = $1 ORDER BY period_end DESC LIMIT 1`,
-      [org_id || 1]
+      `SELECT period_end FROM cash_cuts WHERE warehouse_id = $1 ORDER BY period_end DESC LIMIT 1`,
+      [warehouse_id || 1]
     );
     const since = lastCut.rows[0]?.period_end || '1970-01-01';
 
     const salesRes = await pool.query(
       `SELECT COALESCE(SUM(s.total), 0) AS sales_total, COUNT(*) AS sale_count
        FROM sales s
-       WHERE s.org_id = $1 AND s.warehouse_id = $2 AND s.created_at > $3`,
-      [org_id || 1, warehouse_id || 1, since]
+       WHERE s.warehouse_id = $1 AND s.created_at > $2`,
+      [warehouse_id || 1, since]
     );
 
     const byMethod = await pool.query(
@@ -994,10 +996,10 @@ app.get('/api/cash-cuts/summary', async (req, res) => {
        FROM sale_payments sp
        JOIN sales s ON s.id = sp.sale_id
        JOIN payment_methods pm ON pm.id = sp.payment_method_id
-       WHERE s.org_id = $1 AND s.warehouse_id = $2 AND s.created_at > $3
+       WHERE s.warehouse_id = $1 AND s.created_at > $2
        GROUP BY pm.name
        ORDER BY pm.name`,
-      [org_id || 1, warehouse_id || 1, since]
+      [warehouse_id || 1, since]
     );
 
     res.json({
@@ -1013,18 +1015,18 @@ app.get('/api/cash-cuts/summary', async (req, res) => {
 
 // Cerrar el corte con el efectivo contado físicamente
 app.post('/api/cash-cuts', async (req, res) => {
-  const { org_id, warehouse_id, user_id, counted_cash } = req.body;
+  const { warehouse_id, user_id, counted_cash } = req.body;
   try {
     const lastCut = await pool.query(
-      `SELECT period_end FROM cash_cuts WHERE org_id = $1 ORDER BY period_end DESC LIMIT 1`,
-      [org_id || 1]
+      `SELECT period_end FROM cash_cuts WHERE warehouse_id = $1 ORDER BY period_end DESC LIMIT 1`,
+      [warehouse_id || 1]
     );
     const since = lastCut.rows[0]?.period_end || '1970-01-01';
 
     const salesRes = await pool.query(
       `SELECT COALESCE(SUM(s.total), 0) AS sales_total
-       FROM sales s WHERE s.org_id = $1 AND s.warehouse_id = $2 AND s.created_at > $3`,
-      [org_id || 1, warehouse_id || 1, since]
+       FROM sales s WHERE s.warehouse_id = $1 AND s.created_at > $2`,
+      [warehouse_id || 1, since]
     );
 
     const byMethod = await pool.query(
@@ -1032,21 +1034,23 @@ app.post('/api/cash-cuts', async (req, res) => {
        FROM sale_payments sp
        JOIN sales s ON s.id = sp.sale_id
        JOIN payment_methods pm ON pm.id = sp.payment_method_id
-       WHERE s.org_id = $1 AND s.warehouse_id = $2 AND s.created_at > $3
+       WHERE s.warehouse_id = $1 AND s.created_at > $2
        GROUP BY pm.name`,
-      [org_id || 1, warehouse_id || 1, since]
+      [warehouse_id || 1, since]
     );
 
     const cashMethod = byMethod.rows.find(r => r.method_name.toLowerCase().includes('efectivo'));
     const expectedCash = Number(cashMethod?.total || 0);
     const difference = Number(counted_cash) - expectedCash;
 
+    // org_id = NULL: este corte ya no pertenece a una sola organización,
+    // representa la caja física completa (tienda + cafetería).
     const result = await pool.query(
       `INSERT INTO cash_cuts
        (org_id, warehouse_id, user_id, period_start, period_end, sales_total,
         payments_breakdown, counted_cash, expected_cash, difference)
-       VALUES ($1,$2,$3,$4,NOW(),$5,$6,$7,$8,$9) RETURNING id`,
-      [org_id || 1, warehouse_id || 1, user_id || null, since,
+       VALUES (NULL,$1,$2,$3,NOW(),$4,$5,$6,$7,$8) RETURNING id`,
+      [warehouse_id || 1, user_id || null, since,
        Number(salesRes.rows[0].sales_total),
        JSON.stringify(byMethod.rows), counted_cash, expectedCash, difference]
     );
@@ -1086,6 +1090,49 @@ app.get('/api/cash-cuts', async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+
+app.put('/api/customers/full/:id', async (req, res) => {
+  const { id } = req.params;
+  const { name, email, cfdi_usage, rfc, business_name, tax_regime, phones, addresses } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    await client.query(
+      `UPDATE customers SET name=$1, email=$2, cfdi_usage=$3, rfc=$4, business_name=$5, tax_regime=$6 WHERE id=$7`,
+      [name, email || null, cfdi_usage || null, rfc || null, business_name || null, tax_regime || null, id]
+    );
+
+    // Reemplaza teléfonos y direcciones completos (más simple y confiable que sincronizar uno a uno)
+    await client.query(`DELETE FROM customer_phones WHERE customer_id = $1`, [id]);
+    for (const p of (phones || [])) {
+      await client.query(
+        `INSERT INTO customer_phones (customer_id, phone, label, is_primary) VALUES ($1,$2,$3,$4)`,
+        [id, p.phone, p.label || 'Principal', p.is_primary || false]
+      );
+    }
+
+    await client.query(`DELETE FROM customer_addresses WHERE customer_id = $1`, [id]);
+    for (const a of (addresses || [])) {
+      await client.query(
+        `INSERT INTO customer_addresses
+         (customer_id, label, street, ext_number, int_number, neighborhood, city, state, zip_code, references_text, is_primary)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+        [id, a.label || 'Casa', a.street || null, a.ext_number || null, a.int_number || null,
+         a.neighborhood || null, a.city || null, a.state || null, a.zip_code || null, a.references_text || null, a.is_primary || false]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({ success: true });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
   }
 });
 
