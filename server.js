@@ -670,23 +670,13 @@ app.get('/api/search/all', async (req, res) => {
 
 // Registrar venta de cafetería (descuenta ingredientes del inventario)
 app.post('/api/cafe/sales', async (req, res) => {
-  const { org_id, warehouse_id, items, payments, user_id ,customer_id} = req.body;
+  const { org_id, warehouse_id, items, payments, user_id, customer_id } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    const total = items.reduce((acc, item) => {
-      return acc + (item.final_price * item.quantity);
-    }, 0);
+    const total = items.reduce((acc, item) => acc + (item.final_price * item.quantity), 0);
 
-
-    const subtotalVenta = items.reduce(
-      (acc, item) => acc + (parseFloat(item.price) * item.quantity), 0
-    );
-    const totalConIva = subtotalVenta * 1.16;
-  
-
-    console.log("TOTAL:", total);
     const saleRes = await client.query(
       `INSERT INTO sales (org_id, warehouse_id, total, created_at)
        VALUES ($1,$2,$3,NOW()) RETURNING id`,
@@ -695,14 +685,17 @@ app.post('/api/cafe/sales', async (req, res) => {
     const saleId = saleRes.rows[0].id;
 
     for (const item of items) {
-
-
-
+      // Guardar el detalle de qué se vendió (esto faltaba)
+      await client.query(
+        `INSERT INTO cafe_sale_details
+         (sale_id, cafe_product_id, name, quantity, unit_price, subtotal, selected_options, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [saleId, item.cafe_product_id, item.name, item.quantity, item.final_price,
+         item.final_price * item.quantity, JSON.stringify(item.selected_options || []), item.notes || null]
+      );
 
       const recipe = await client.query(
-        `SELECT ingredient_product_id, quantity, unit
-         FROM cafe_recipes
-         WHERE cafe_product_id = $1`,
+        `SELECT ingredient_product_id, quantity, unit FROM cafe_recipes WHERE cafe_product_id = $1`,
         [item.cafe_product_id]
       );
 
@@ -710,37 +703,24 @@ app.post('/api/cafe/sales', async (req, res) => {
         .filter(o => o.ingredient_product_id && o.ingredient_qty > 0);
 
       const ingredientMap = {};
-
       for (const r of recipe.rows) {
         const key = r.ingredient_product_id;
-        const isReplaced = modIngredients.some(
-          m => m.replaces_ingredient_id === key
-        );
-        if (!isReplaced) {
-          ingredientMap[key] = (ingredientMap[key] || 0) + Number(r.quantity);
-        }
+        const isReplaced = modIngredients.some(m => m.replaces_ingredient_id === key);
+        if (!isReplaced) ingredientMap[key] = (ingredientMap[key] || 0) + Number(r.quantity);
       }
-
       for (const m of modIngredients) {
         const key = m.ingredient_product_id;
         ingredientMap[key] = (ingredientMap[key] || 0) + Number(m.ingredient_qty);
       }
 
       for (const [productId, qty] of Object.entries(ingredientMap)) {
-
-        console.log("PRODUCT ID:", productId);
-console.log("QTY:", qty);
-
-
         const invRes = await client.query(
-          `SELECT quantity FROM inventory
-           WHERE org_id=$1 AND warehouse_id=$2 AND product_id=$3`,
+          `SELECT quantity FROM inventory WHERE org_id=$1 AND warehouse_id=$2 AND product_id=$3`,
           [org_id || 2, warehouse_id || 1, productId]
         );
-        console.log("INV RES:", invRes.rows);
         const before = parseFloat(invRes.rows[0]?.quantity || 0);
-        const after  = before - (qty * item.quantity);
-        console.log("BEFORE:", before, "AFTER:", after);
+        const after = before - (qty * item.quantity);
+
         await client.query(
           `INSERT INTO inventory (org_id, warehouse_id, product_id, quantity)
            VALUES ($1,$2,$3,$4)
@@ -754,35 +734,31 @@ console.log("QTY:", qty);
            (org_id, warehouse_id, product_id, movement_type, quantity,
             quantity_before, quantity_after, unit_cost, reference_type, reference_id, user_id)
            VALUES ($1,$2,$3,'venta',$4,$5,$6,0,'sale',$7,$8)`,
-          [org_id || 2, warehouse_id || 1, productId,
-           qty * item.quantity, before, after, saleId, user_id || null]
+          [org_id || 2, warehouse_id || 1, productId, qty * item.quantity, before, after, saleId, user_id || null]
         );
       }
     }
 
     for (const pay of payments) {
-      
-    console.log("PAY:", pay);
       await client.query(
-        `INSERT INTO sale_payments (sale_id, payment_method_id, amount)
-         VALUES ($1,$2,$3)`,
+        `INSERT INTO sale_payments (sale_id, payment_method_id, amount) VALUES ($1,$2,$3)`,
         [saleId, pay.payment_method_id, pay.amount]
       );
     }
 
-
+    // Monedero — corregido: usa "total" (ya correcto), no la variable NaN de antes
     if (customer_id) {
-      const orgRes = await client.query(`SELECT loyalty_earn_pct FROM organizations WHERE id = $1`, [org_id || 1]);
+      const orgRes = await client.query(`SELECT loyalty_earn_pct FROM organizations WHERE id = $1`, [org_id || 2]);
       const pct = Number(orgRes.rows[0]?.loyalty_earn_pct || 0);
       if (pct > 0) {
-        const earned = Number((totalConIva * (pct / 100)).toFixed(2));
+        const earned = Number((total * (pct / 100)).toFixed(2));
         const custRes = await client.query(`SELECT wallet_balance FROM customers WHERE id = $1 FOR UPDATE`, [customer_id]);
         if (custRes.rows.length > 0) {
           const newBalance = Number(custRes.rows[0].wallet_balance) + earned;
           await client.query(`UPDATE customers SET wallet_balance = $1 WHERE id = $2`, [newBalance, customer_id]);
           await client.query(
             `INSERT INTO customer_wallet_movements (customer_id, sale_id, movement_type, amount, balance_after, notes)
-             VALUES ($1,$2,'earn',$3,$4,'Compra en tienda')`,
+             VALUES ($1,$2,'earn',$3,$4,'Compra en cafetería')`,
             [customer_id, saleId, earned, newBalance]
           );
         }
@@ -994,6 +970,92 @@ app.put('/api/organizations/:id/loyalty-settings', async (req, res) => {
 });
 
 
+// ================= CORTE DE CAJA =================
+
+// Resumen desde el último corte (o desde siempre si no hay ninguno)
+app.get('/api/cash-cuts/summary', async (req, res) => {
+  const { org_id, warehouse_id } = req.query;
+  try {
+    const lastCut = await pool.query(
+      `SELECT period_end FROM cash_cuts WHERE org_id = $1 ORDER BY period_end DESC LIMIT 1`,
+      [org_id || 1]
+    );
+    const since = lastCut.rows[0]?.period_end || '1970-01-01';
+
+    const salesRes = await pool.query(
+      `SELECT COALESCE(SUM(s.total), 0) AS sales_total, COUNT(*) AS sale_count
+       FROM sales s
+       WHERE s.org_id = $1 AND s.warehouse_id = $2 AND s.created_at > $3`,
+      [org_id || 1, warehouse_id || 1, since]
+    );
+
+    const byMethod = await pool.query(
+      `SELECT pm.name AS method_name, COALESCE(SUM(sp.amount), 0) AS total
+       FROM sale_payments sp
+       JOIN sales s ON s.id = sp.sale_id
+       JOIN payment_methods pm ON pm.id = sp.payment_method_id
+       WHERE s.org_id = $1 AND s.warehouse_id = $2 AND s.created_at > $3
+       GROUP BY pm.name
+       ORDER BY pm.name`,
+      [org_id || 1, warehouse_id || 1, since]
+    );
+
+    res.json({
+      period_start: since,
+      sales_total: Number(salesRes.rows[0].sales_total),
+      sale_count: Number(salesRes.rows[0].sale_count),
+      by_method: byMethod.rows.map(r => ({ method_name: r.method_name, total: Number(r.total) })),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Cerrar el corte con el efectivo contado físicamente
+app.post('/api/cash-cuts', async (req, res) => {
+  const { org_id, warehouse_id, user_id, counted_cash } = req.body;
+  try {
+    const lastCut = await pool.query(
+      `SELECT period_end FROM cash_cuts WHERE org_id = $1 ORDER BY period_end DESC LIMIT 1`,
+      [org_id || 1]
+    );
+    const since = lastCut.rows[0]?.period_end || '1970-01-01';
+
+    const salesRes = await pool.query(
+      `SELECT COALESCE(SUM(s.total), 0) AS sales_total
+       FROM sales s WHERE s.org_id = $1 AND s.warehouse_id = $2 AND s.created_at > $3`,
+      [org_id || 1, warehouse_id || 1, since]
+    );
+
+    const byMethod = await pool.query(
+      `SELECT pm.name AS method_name, COALESCE(SUM(sp.amount), 0) AS total
+       FROM sale_payments sp
+       JOIN sales s ON s.id = sp.sale_id
+       JOIN payment_methods pm ON pm.id = sp.payment_method_id
+       WHERE s.org_id = $1 AND s.warehouse_id = $2 AND s.created_at > $3
+       GROUP BY pm.name`,
+      [org_id || 1, warehouse_id || 1, since]
+    );
+
+    const cashMethod = byMethod.rows.find(r => r.method_name.toLowerCase().includes('efectivo'));
+    const expectedCash = Number(cashMethod?.total || 0);
+    const difference = Number(counted_cash) - expectedCash;
+
+    const result = await pool.query(
+      `INSERT INTO cash_cuts
+       (org_id, warehouse_id, user_id, period_start, period_end, sales_total,
+        payments_breakdown, counted_cash, expected_cash, difference)
+       VALUES ($1,$2,$3,$4,NOW(),$5,$6,$7,$8,$9) RETURNING id`,
+      [org_id || 1, warehouse_id || 1, user_id || null, since,
+       Number(salesRes.rows[0].sales_total),
+       JSON.stringify(byMethod.rows), counted_cash, expectedCash, difference]
+    );
+
+    res.json({ success: true, cutId: result.rows[0].id, expectedCash, difference });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`💻 Server corriendo en puerto ${PORT}`));
