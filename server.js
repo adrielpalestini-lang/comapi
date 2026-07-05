@@ -732,9 +732,10 @@ console.log("QTY:", qty);
            WHERE org_id=$1 AND warehouse_id=$2 AND product_id=$3`,
           [org_id || 2, warehouse_id || 1, productId]
         );
+        console.log("INV RES:", invRes.rows);
         const before = parseFloat(invRes.rows[0]?.quantity || 0);
         const after  = before - (qty * item.quantity);
-
+        console.log("BEFORE:", before, "AFTER:", after);
         await client.query(
           `INSERT INTO inventory (org_id, warehouse_id, product_id, quantity)
            VALUES ($1,$2,$3,$4)
