@@ -754,8 +754,9 @@ console.log("QTY:", qty);
       }
     }
 
-    console.log("PAY:", pay);
     for (const pay of payments) {
+      
+    console.log("PAY:", pay);
       await client.query(
         `INSERT INTO sale_payments (sale_id, payment_method_id, amount)
          VALUES ($1,$2,$3)`,
