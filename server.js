@@ -310,7 +310,7 @@ app.put('/api/customers/:id', async (req, res) => {
 
 // ================= VENTAS =================
 app.post('/api/sales', async (req, res) => {
-  const { org_id, warehouse_id, items, payments, user_id } = req.body;
+  const { org_id, warehouse_id, items, payments, user_id, customer_id } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -364,6 +364,25 @@ app.post('/api/sales', async (req, res) => {
         `INSERT INTO sale_payments (sale_id, payment_method_id, amount) VALUES ($1,$2,$3)`,
         [saleId, pay.payment_method_id, pay.amount]
       );
+    }
+
+
+    if (customer_id) {
+      const orgRes = await client.query(`SELECT loyalty_earn_pct FROM organizations WHERE id = $1`, [org_id || 1]);
+      const pct = Number(orgRes.rows[0]?.loyalty_earn_pct || 0);
+      if (pct > 0) {
+        const earned = Number((totalConIva * (pct / 100)).toFixed(2));
+        const custRes = await client.query(`SELECT wallet_balance FROM customers WHERE id = $1 FOR UPDATE`, [customer_id]);
+        if (custRes.rows.length > 0) {
+          const newBalance = Number(custRes.rows[0].wallet_balance) + earned;
+          await client.query(`UPDATE customers SET wallet_balance = $1 WHERE id = $2`, [newBalance, customer_id]);
+          await client.query(
+            `INSERT INTO customer_wallet_movements (customer_id, sale_id, movement_type, amount, balance_after, notes)
+             VALUES ($1,$2,'earn',$3,$4,'Compra en tienda')`,
+            [customer_id, saleId, earned, newBalance]
+          );
+        }
+      }
     }
 
     await client.query('COMMIT');
@@ -731,6 +750,25 @@ app.post('/api/cafe/sales', async (req, res) => {
       );
     }
 
+
+    if (customer_id) {
+      const orgRes = await client.query(`SELECT loyalty_earn_pct FROM organizations WHERE id = $1`, [org_id || 1]);
+      const pct = Number(orgRes.rows[0]?.loyalty_earn_pct || 0);
+      if (pct > 0) {
+        const earned = Number((totalConIva * (pct / 100)).toFixed(2));
+        const custRes = await client.query(`SELECT wallet_balance FROM customers WHERE id = $1 FOR UPDATE`, [customer_id]);
+        if (custRes.rows.length > 0) {
+          const newBalance = Number(custRes.rows[0].wallet_balance) + earned;
+          await client.query(`UPDATE customers SET wallet_balance = $1 WHERE id = $2`, [newBalance, customer_id]);
+          await client.query(
+            `INSERT INTO customer_wallet_movements (customer_id, sale_id, movement_type, amount, balance_after, notes)
+             VALUES ($1,$2,'earn',$3,$4,'Compra en tienda')`,
+            [customer_id, saleId, earned, newBalance]
+          );
+        }
+      }
+    }
+
     await client.query('COMMIT');
     res.json({ success: true, saleId });
   } catch (error) {
@@ -740,6 +778,202 @@ app.post('/api/cafe/sales', async (req, res) => {
     client.release();
   }
 });
+
+
+// ================= CATÁLOGO CFDI =================
+app.get('/api/cfdi-catalog', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT code, description FROM cfdi_usage_catalog WHERE is_active = TRUE ORDER BY code`
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ================= CLIENTES (extendido) =================
+
+// Búsqueda rápida por teléfono o nombre (para el POS)
+app.get('/api/customers/search', async (req, res) => {
+  const { q, org_id } = req.query;
+  if (!q || q.trim().length < 3) return res.json([]);
+  try {
+    const result = await pool.query(
+      `SELECT DISTINCT c.id, c.name, c.email, c.wallet_balance,
+              cp.phone AS matched_phone
+       FROM customers c
+       LEFT JOIN customer_phones cp ON cp.customer_id = c.id
+       WHERE c.org_id = $1 AND c.is_active = TRUE
+         AND (c.name ILIKE $2 OR cp.phone ILIKE $2)
+       ORDER BY c.name
+       LIMIT 10`,
+      [org_id || 1, `%${q.trim()}%`]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Listado paginado
+app.get('/api/customers/paginated', async (req, res) => {
+  const { org_id, page = 1, limit = 20 } = req.query;
+  const offset = (Number(page) - 1) * Number(limit);
+  try {
+    const totalRes = await pool.query(
+      `SELECT COUNT(*) FROM customers WHERE org_id = $1 AND is_active = TRUE`,
+      [org_id || 1]
+    );
+    const result = await pool.query(
+      `SELECT id, name, email, wallet_balance, cfdi_usage
+       FROM customers
+       WHERE org_id = $1 AND is_active = TRUE
+       ORDER BY name
+       LIMIT $2 OFFSET $3`,
+      [org_id || 1, limit, offset]
+    );
+    res.json({
+      customers: result.rows,
+      total: Number(totalRes.rows[0].count),
+      page: Number(page),
+      totalPages: Math.ceil(Number(totalRes.rows[0].count) / Number(limit)),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Detalle completo (teléfonos, direcciones, historial de monedero)
+app.get('/api/customers/:id/full', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const customer = await pool.query(`SELECT * FROM customers WHERE id = $1`, [id]);
+    if (customer.rows.length === 0) return res.status(404).json({ error: 'Cliente no encontrado' });
+
+    const phones = await pool.query(
+      `SELECT id, phone, label, is_primary FROM customer_phones WHERE customer_id = $1 ORDER BY is_primary DESC`,
+      [id]
+    );
+    const addresses = await pool.query(
+      `SELECT * FROM customer_addresses WHERE customer_id = $1 ORDER BY is_primary DESC`,
+      [id]
+    );
+    const walletHistory = await pool.query(
+      `SELECT id, movement_type, amount, balance_after, notes, created_at
+       FROM customer_wallet_movements
+       WHERE customer_id = $1
+       ORDER BY created_at DESC
+       LIMIT 50`,
+      [id]
+    );
+
+    res.json({
+      ...customer.rows[0],
+      phones: phones.rows,
+      addresses: addresses.rows,
+      wallet_history: walletHistory.rows,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Crear cliente con teléfonos y direcciones en un solo request
+app.post('/api/customers/full', async (req, res) => {
+  const { org_id, name, email, cfdi_usage, rfc, business_name, tax_regime, phones, addresses } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const custRes = await client.query(
+      `INSERT INTO customers (org_id, name, email, cfdi_usage, rfc, business_name, tax_regime, wallet_balance)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,0) RETURNING id`,
+      [org_id || 1, name, email || null, cfdi_usage || null,
+       rfc || null, business_name || null, tax_regime || null]
+    );
+    const customerId = custRes.rows[0].id;
+
+    for (const p of (phones || [])) {
+      await client.query(
+        `INSERT INTO customer_phones (customer_id, phone, label, is_primary) VALUES ($1,$2,$3,$4)`,
+        [customerId, p.phone, p.label || 'Principal', p.is_primary || false]
+      );
+    }
+
+    for (const a of (addresses || [])) {
+      await client.query(
+        `INSERT INTO customer_addresses
+         (customer_id, label, street, ext_number, int_number, neighborhood, city, state, zip_code, references_text, is_primary)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+        [customerId, a.label || 'Casa', a.street || null, a.ext_number || null, a.int_number || null,
+         a.neighborhood || null, a.city || null, a.state || null, a.zip_code || null,
+         a.references_text || null, a.is_primary || false]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({ success: true, customerId });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Ajuste manual de monedero (opcional, para casos especiales)
+app.post('/api/customers/:id/wallet-adjustment', async (req, res) => {
+  const { id } = req.params;
+  const { amount, notes } = req.body; // amount puede ser negativo
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const cust = await client.query(`SELECT wallet_balance FROM customers WHERE id = $1 FOR UPDATE`, [id]);
+    if (cust.rows.length === 0) throw new Error('Cliente no encontrado');
+
+    const newBalance = Number(cust.rows[0].wallet_balance) + Number(amount);
+    await client.query(`UPDATE customers SET wallet_balance = $1 WHERE id = $2`, [newBalance, id]);
+    await client.query(
+      `INSERT INTO customer_wallet_movements (customer_id, movement_type, amount, balance_after, notes)
+       VALUES ($1,'adjustment',$2,$3,$4)`,
+      [id, amount, newBalance, notes || null]
+    );
+
+    await client.query('COMMIT');
+    res.json({ success: true, newBalance });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Configuración de % de monedero por organización
+app.get('/api/organizations/:id/loyalty-settings', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, loyalty_earn_pct FROM organizations WHERE id = $1`,
+      [req.params.id]
+    );
+    res.json(result.rows[0] || { loyalty_earn_pct: 0 });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/organizations/:id/loyalty-settings', async (req, res) => {
+  const { loyalty_earn_pct } = req.body;
+  try {
+    await pool.query(`UPDATE organizations SET loyalty_earn_pct = $1 WHERE id = $2`, [loyalty_earn_pct, req.params.id]);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`💻 Server corriendo en puerto ${PORT}`));
