@@ -1064,12 +1064,12 @@ app.post('/api/cash-cuts', async (req, res) => {
 
 // Historial de cortes ya realizados
 app.get('/api/cash-cuts', async (req, res) => {
-  const { org_id, page = 1, limit = 15 } = req.query;
+  const { warehouse_id, page = 1, limit = 15 } = req.query;
   const offset = (Number(page) - 1) * Number(limit);
   try {
     const totalRes = await pool.query(
-      `SELECT COUNT(*) FROM cash_cuts WHERE org_id = $1`,
-      [org_id || 1]
+      `SELECT COUNT(*) FROM cash_cuts WHERE warehouse_id = $1`,
+      [warehouse_id || 1]
     );
     const result = await pool.query(
       `SELECT cc.id, cc.period_start, cc.period_end, cc.sales_total,
@@ -1077,10 +1077,10 @@ app.get('/api/cash-cuts', async (req, res) => {
               cc.payments_breakdown, u.name AS user_name
        FROM cash_cuts cc
        LEFT JOIN users u ON u.id = cc.user_id
-       WHERE cc.org_id = $1
+       WHERE cc.warehouse_id = $1
        ORDER BY cc.period_end DESC
        LIMIT $2 OFFSET $3`,
-      [org_id || 1, limit, offset]
+      [warehouse_id || 1, limit, offset]
     );
     res.json({
       cuts: result.rows,
@@ -1136,6 +1136,69 @@ app.put('/api/customers/full/:id', async (req, res) => {
   }
 });
 
+
+// Ventas detalladas de un corte YA CERRADO (para reimprimir desde el historial)
+app.get('/api/cash-cuts/:id/sales', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const cut = await pool.query(`SELECT * FROM cash_cuts WHERE id = $1`, [id]);
+    if (cut.rows.length === 0) return res.status(404).json({ error: 'Corte no encontrado' });
+
+    const { warehouse_id, period_start, period_end } = cut.rows[0];
+
+    const sales = await pool.query(
+      `SELECT s.id, s.org_id, o.name AS org_name, s.total, s.created_at,
+              COALESCE(
+                json_agg(json_build_object('method_name', pm.name, 'amount', sp.amount))
+                FILTER (WHERE sp.id IS NOT NULL), '[]'
+              ) AS payments
+       FROM sales s
+       JOIN organizations o ON o.id = s.org_id
+       LEFT JOIN sale_payments sp ON sp.sale_id = s.id
+       LEFT JOIN payment_methods pm ON pm.id = sp.payment_method_id
+       WHERE s.warehouse_id = $1 AND s.created_at > $2 AND s.created_at <= $3
+       GROUP BY s.id, o.name
+       ORDER BY s.created_at ASC`,
+      [warehouse_id, period_start, period_end]
+    );
+
+    res.json({ cut: cut.rows[0], sales: sales.rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Ventas del período ACTUAL (aún no se ha cerrado el corte) — para imprimir un preview
+app.get('/api/cash-cuts/current-sales', async (req, res) => {
+  const { warehouse_id } = req.query;
+  try {
+    const lastCut = await pool.query(
+      `SELECT period_end FROM cash_cuts WHERE warehouse_id = $1 ORDER BY period_end DESC LIMIT 1`,
+      [warehouse_id || 1]
+    );
+    const since = lastCut.rows[0]?.period_end || '1970-01-01';
+
+    const sales = await pool.query(
+      `SELECT s.id, s.org_id, o.name AS org_name, s.total, s.created_at,
+              COALESCE(
+                json_agg(json_build_object('method_name', pm.name, 'amount', sp.amount))
+                FILTER (WHERE sp.id IS NOT NULL), '[]'
+              ) AS payments
+       FROM sales s
+       JOIN organizations o ON o.id = s.org_id
+       LEFT JOIN sale_payments sp ON sp.sale_id = s.id
+       LEFT JOIN payment_methods pm ON pm.id = sp.payment_method_id
+       WHERE s.warehouse_id = $1 AND s.created_at > $2
+       GROUP BY s.id, o.name
+       ORDER BY s.created_at ASC`,
+      [warehouse_id || 1, since]
+    );
+
+    res.json({ period_start: since, sales: sales.rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`💻 Server corriendo en puerto ${PORT}`));
