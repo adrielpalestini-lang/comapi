@@ -679,6 +679,9 @@ app.post('/api/cafe/sales', async (req, res) => {
       return acc + (item.final_price * item.quantity);
     }, 0);
 
+  
+
+    console.log("TOTAL:", total);
     const saleRes = await client.query(
       `INSERT INTO sales (org_id, warehouse_id, total, created_at)
        VALUES ($1,$2,$3,NOW()) RETURNING id`,
@@ -687,6 +690,11 @@ app.post('/api/cafe/sales', async (req, res) => {
     const saleId = saleRes.rows[0].id;
 
     for (const item of items) {
+
+      console.log("PRODUCT ID:", productId);
+console.log("QTY:", qty);
+
+
       const recipe = await client.query(
         `SELECT ingredient_product_id, quantity, unit
          FROM cafe_recipes
@@ -715,6 +723,11 @@ app.post('/api/cafe/sales', async (req, res) => {
       }
 
       for (const [productId, qty] of Object.entries(ingredientMap)) {
+
+        console.log("PRODUCT ID:", productId);
+console.log("QTY:", qty);
+
+
         const invRes = await client.query(
           `SELECT quantity FROM inventory
            WHERE org_id=$1 AND warehouse_id=$2 AND product_id=$3`,
@@ -742,6 +755,7 @@ app.post('/api/cafe/sales', async (req, res) => {
       }
     }
 
+    console.log("PAY:", pay);
     for (const pay of payments) {
       await client.query(
         `INSERT INTO sale_payments (sale_id, payment_method_id, amount)
