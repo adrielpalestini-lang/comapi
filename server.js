@@ -1525,5 +1525,36 @@ app.get('/api/reports/sales-live', async (req, res) => {
   }
 });
 
+// Productos de cafetería más vendidos en un período
+app.get('/api/reports/cafe-top-products', async (req, res) => {
+  const { warehouse_id, from, to } = req.query;
+  try {
+    const result = await pool.query(
+      `SELECT csd.cafe_product_id, csd.name,
+              SUM(csd.quantity) AS total_qty,
+              SUM(csd.subtotal) AS total_revenue,
+              COUNT(DISTINCT csd.sale_id) AS times_sold
+       FROM cafe_sale_details csd
+       JOIN sales s ON s.id = csd.sale_id
+       WHERE s.warehouse_id = $1
+         AND ($2::date IS NULL OR s.created_at >= $2::date)
+         AND ($3::date IS NULL OR s.created_at < $3::date + interval '1 day')
+       GROUP BY csd.cafe_product_id, csd.name
+       ORDER BY total_qty DESC`,
+      [warehouse_id || 1, from || null, to || null]
+    );
+    res.json(result.rows.map(r => ({
+      cafe_product_id: r.cafe_product_id,
+      name: r.name,
+      total_qty: Number(r.total_qty),
+      total_revenue: Number(r.total_revenue),
+      times_sold: Number(r.times_sold),
+    })));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`💻 Server corriendo en puerto ${PORT}`));
