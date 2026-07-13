@@ -1200,5 +1200,330 @@ app.get('/api/cash-cuts/current-sales', async (req, res) => {
   }
 });
 
+
+// ================= PRODUCTOS: LISTADO Y EDICIÓN (para el dashboard) =================
+ 
+app.get('/api/products/list', async (req, res) => {
+  const { org_id, page = 1, limit = 20, q } = req.query;
+  const offset = (Number(page) - 1) * Number(limit);
+  try {
+    const params = [org_id || 1];
+    let searchClause = '';
+    if (q && q.trim()) {
+      params.push(`%${q.trim()}%`);
+      searchClause = `AND (p.sku ILIKE $${params.length} OR p.name ILIKE $${params.length})`;
+    }
+ 
+    const totalRes = await pool.query(
+      `SELECT COUNT(*) FROM v_products_full p WHERE p.org_id = $1 ${searchClause}`,
+      params
+    );
+ 
+    params.push(limit, offset);
+    const result = await pool.query(
+      `SELECT p.id, p.sku, p.name, p.description, p.category, p.unit_type, p.pieces_per_box,
+              p.stock_alert_limit, p.price_with_tax, p.price_no_tax, p.cost_no_tax,
+              p.is_active
+       FROM v_products_full p
+       WHERE p.org_id = $1 ${searchClause}
+       ORDER BY p.name
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
+    );
+ 
+    res.json({
+      products: result.rows,
+      total: Number(totalRes.rows[0].count),
+      page: Number(page),
+      totalPages: Math.ceil(Number(totalRes.rows[0].count) / Number(limit)),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+ 
+app.put('/api/products/:id', async (req, res) => {
+  const { id } = req.params;
+  const {
+    name, description, category, unit_type, pieces_per_box, stock_alert_limit,
+    org_id, cost_no_tax, price_no_tax, price_with_tax, tax_rate, user_id,
+  } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+ 
+    await client.query(
+      `UPDATE products SET name=$1, description=$2, category=$3, unit_type=$4,
+       pieces_per_box=$5, stock_alert_limit=$6 WHERE id=$7`,
+      [name, description || null, category || null, unit_type || 'pieza',
+       pieces_per_box || 1, stock_alert_limit || 5, id]
+    );
+ 
+    // Si mandan precio nuevo, se agrega una fila nueva en product_prices (historial de precios)
+    if ((price_with_tax || price_no_tax) && org_id) {
+      const skuRes = await client.query(`SELECT sku FROM products WHERE id = $1`, [id]);
+      const sku = skuRes.rows[0]?.sku;
+      const priceSinIva = price_no_tax || (price_with_tax / 1.16);
+      const precioConIva = price_with_tax || (price_no_tax * 1.16);
+      const profit = priceSinIva - (cost_no_tax || 0);
+      const profitPct = cost_no_tax > 0 ? (profit / cost_no_tax) * 100 : 0;
+ 
+      await client.query(
+        `INSERT INTO product_prices
+         (sku, product_id, org_id, cost_no_tax, price_no_tax, price_with_tax, tax_rate, profit, profit_pct, created_by, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'Editado desde dashboard')`,
+        [sku, id, org_id, cost_no_tax || 0, priceSinIva, precioConIva, tax_rate || 16, profit, profitPct, user_id || null]
+      );
+    }
+ 
+    await client.query('COMMIT');
+    res.json({ success: true });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+ 
+app.put('/api/products/:id/toggle-active', async (req, res) => {
+  const { id } = req.params;
+  const { org_id, is_active } = req.body;
+  try {
+    await pool.query(
+      `UPDATE organization_products SET is_active = $1 WHERE product_id = $2 AND org_id = $3`,
+      [is_active, id, org_id || 1]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+ 
+// ================= CAFETERÍA: CRUD DE PRODUCTOS (para el dashboard) =================
+ 
+app.get('/api/cafe/products/list', async (req, res) => {
+  const { org_id } = req.query;
+  try {
+    const result = await pool.query(
+      `SELECT id, name, description, base_price, is_active
+       FROM cafe_products WHERE org_id = $1 ORDER BY name`,
+      [org_id || 2]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+ 
+app.post('/api/cafe/products', async (req, res) => {
+  const { org_id, name, description, base_price } = req.body;
+  try {
+    const result = await pool.query(
+      `INSERT INTO cafe_products (org_id, name, description, base_price) VALUES ($1,$2,$3,$4) RETURNING id`,
+      [org_id || 2, name, description || null, base_price || 0]
+    );
+    res.json({ success: true, id: result.rows[0].id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+ 
+app.put('/api/cafe/products/:id', async (req, res) => {
+  const { id } = req.params;
+  const { name, description, base_price, is_active } = req.body;
+  try {
+    await pool.query(
+      `UPDATE cafe_products SET name=$1, description=$2, base_price=$3, is_active=$4 WHERE id=$5`,
+      [name, description || null, base_price || 0, is_active ?? true, id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+ 
+// ================= CAFETERÍA: CRUD DE GRUPOS DE MODIFICADORES =================
+ 
+app.get('/api/cafe/modifier-groups', async (req, res) => {
+  const { org_id } = req.query;
+  try {
+    const result = await pool.query(
+      `SELECT id, name, sort_order, required, multiple, is_active
+       FROM cafe_modifier_groups WHERE org_id = $1 ORDER BY sort_order, name`,
+      [org_id || 2]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+ 
+app.post('/api/cafe/modifier-groups', async (req, res) => {
+  const { org_id, name, sort_order, required, multiple } = req.body;
+  try {
+    const result = await pool.query(
+      `INSERT INTO cafe_modifier_groups (org_id, name, sort_order, required, multiple)
+       VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+      [org_id || 2, name, sort_order || 0, required || false, multiple || false]
+    );
+    res.json({ success: true, id: result.rows[0].id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+ 
+app.put('/api/cafe/modifier-groups/:id', async (req, res) => {
+  const { id } = req.params;
+  const { name, sort_order, required, multiple, is_active } = req.body;
+  try {
+    await pool.query(
+      `UPDATE cafe_modifier_groups SET name=$1, sort_order=$2, required=$3, multiple=$4, is_active=$5 WHERE id=$6`,
+      [name, sort_order || 0, required || false, multiple || false, is_active ?? true, id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+ 
+// ================= CAFETERÍA: CRUD DE OPCIONES DE MODIFICADORES =================
+ 
+app.get('/api/cafe/modifier-groups/:groupId/options', async (req, res) => {
+  const { groupId } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT id, name, price_delta, ingredient_product_id, ingredient_qty, ingredient_unit, sort_order, is_active
+       FROM cafe_modifier_options WHERE group_id = $1 ORDER BY sort_order`,
+      [groupId]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+ 
+app.post('/api/cafe/modifier-options', async (req, res) => {
+  const { group_id, name, price_delta, ingredient_product_id, ingredient_qty, ingredient_unit, sort_order } = req.body;
+  try {
+    const result = await pool.query(
+      `INSERT INTO cafe_modifier_options
+       (group_id, name, price_delta, ingredient_product_id, ingredient_qty, ingredient_unit, sort_order)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+      [group_id, name, price_delta || 0, ingredient_product_id || null, ingredient_qty || 0, ingredient_unit || null, sort_order || 0]
+    );
+    res.json({ success: true, id: result.rows[0].id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+ 
+app.put('/api/cafe/modifier-options/:id', async (req, res) => {
+  const { id } = req.params;
+  const { name, price_delta, ingredient_product_id, ingredient_qty, ingredient_unit, sort_order, is_active } = req.body;
+  try {
+    await pool.query(
+      `UPDATE cafe_modifier_options
+       SET name=$1, price_delta=$2, ingredient_product_id=$3, ingredient_qty=$4, ingredient_unit=$5, sort_order=$6, is_active=$7
+       WHERE id=$8`,
+      [name, price_delta || 0, ingredient_product_id || null, ingredient_qty || 0, ingredient_unit || null, sort_order || 0, is_active ?? true, id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+ 
+// ================= CAFETERÍA: LIGAR/DESLIGAR GRUPOS A PRODUCTOS =================
+ 
+app.post('/api/cafe/products/:id/modifier-groups', async (req, res) => {
+  const { id } = req.params;
+  const { group_id, sort_order } = req.body;
+  try {
+    await pool.query(
+      `INSERT INTO cafe_product_modifiers (cafe_product_id, group_id, sort_order) VALUES ($1,$2,$3)`,
+      [id, group_id, sort_order || 0]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+ 
+app.delete('/api/cafe/products/:id/modifier-groups/:groupId', async (req, res) => {
+  const { id, groupId } = req.params;
+  try {
+    await pool.query(
+      `DELETE FROM cafe_product_modifiers WHERE cafe_product_id = $1 AND group_id = $2`,
+      [id, groupId]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+ 
+// ================= REPORTES =================
+ 
+// Ventas del día agrupadas (para gráfica de barras / tabla)
+app.get('/api/reports/sales-daily', async (req, res) => {
+  const { warehouse_id, from, to } = req.query;
+  try {
+    const result = await pool.query(
+      `SELECT DATE(s.created_at) AS day,
+              COUNT(*) AS sale_count,
+              SUM(s.total) AS total,
+              SUM(CASE WHEN s.org_id = 1 THEN s.total ELSE 0 END) AS total_tienda,
+              SUM(CASE WHEN s.org_id = 2 THEN s.total ELSE 0 END) AS total_cafe
+       FROM sales s
+       WHERE s.warehouse_id = $1
+         AND ($2::date IS NULL OR s.created_at >= $2::date)
+         AND ($3::date IS NULL OR s.created_at < $3::date + interval '1 day')
+       GROUP BY DATE(s.created_at)
+       ORDER BY day DESC`,
+      [warehouse_id || 1, from || null, to || null]
+    );
+    res.json(result.rows.map(r => ({
+      day: r.day,
+      sale_count: Number(r.sale_count),
+      total: Number(r.total),
+      total_tienda: Number(r.total_tienda),
+      total_cafe: Number(r.total_cafe),
+    })));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+ 
+// Ventas "en vivo": últimas N, o de las últimas X horas
+app.get('/api/reports/sales-live', async (req, res) => {
+  const { warehouse_id, minutes = 240 } = req.query;
+  try {
+    const result = await pool.query(
+      `SELECT s.id, s.org_id, o.name AS org_name, s.total, s.created_at,
+              u.name AS cashier_name,
+              COALESCE(
+                json_agg(json_build_object('method_name', pm.name, 'amount', sp.amount))
+                FILTER (WHERE sp.id IS NOT NULL), '[]'
+              ) AS payments
+       FROM sales s
+       JOIN organizations o ON o.id = s.org_id
+       LEFT JOIN sale_payments sp ON sp.sale_id = s.id
+       LEFT JOIN payment_methods pm ON pm.id = sp.payment_method_id
+       LEFT JOIN inventory_movements im ON im.reference_type = 'sale' AND im.reference_id = s.id
+       LEFT JOIN users u ON u.id = im.user_id
+       WHERE s.warehouse_id = $1
+         AND s.created_at > NOW() - ($2 || ' minutes')::interval
+       GROUP BY s.id, o.name, u.name
+       ORDER BY s.created_at DESC
+       LIMIT 100`,
+      [warehouse_id || 1, minutes]
+    );
+    res.json(result.rows.map(r => ({ ...r, total: Number(r.total) })));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`💻 Server corriendo en puerto ${PORT}`));
