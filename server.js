@@ -678,6 +678,8 @@ app.post('/api/cafe/sales', async (req, res) => {
     const subtotal = items.reduce((acc, item) => acc + (item.final_price * item.quantity), 0);
     const total = Math.max(subtotal - (Number(discount_amount) || 0), 0);
 
+    const totalConIva = Math.max(subtotalVenta * 1.16 - (Number(discount_amount) || 0), 0);
+
     const saleRes = await client.query(
       `INSERT INTO sales (org_id, warehouse_id, total, discount_amount, discount_notes, created_at)
       VALUES ($1,$2,$3,$4,$5,NOW()) RETURNING id`,
