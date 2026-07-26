@@ -310,7 +310,7 @@ app.put('/api/customers/:id', async (req, res) => {
 
 // ================= VENTAS =================
 app.post('/api/sales', async (req, res) => {
-  const { org_id, warehouse_id, items, payments, user_id, customer_id, discount_amount } = req.body;
+  const { org_id, warehouse_id, items, payments, user_id, customer_id, discount_amount, discount_notes } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -321,9 +321,9 @@ app.post('/api/sales', async (req, res) => {
     const totalConIva = Math.max(subtotalVenta * 1.16 - (Number(discount_amount) || 0), 0);
 
     const saleRes = await client.query(
-      `INSERT INTO sales (org_id, warehouse_id, total, discount_amount, created_at)
-       VALUES ($1,$2,$3,$4,NOW()) RETURNING id`,
-      [org_id || 1, warehouse_id || 1, totalConIva, discount_amount || 0]
+      `INSERT INTO sales (org_id, warehouse_id, total, discount_amount, discount_notes, created_at)
+      VALUES ($1,$2,$3,$4,$5,NOW()) RETURNING id`,
+      [org_id || 1, warehouse_id || 1, totalConIva, discount_amount || 0, discount_notes || null]
     );
     const saleId = saleRes.rows[0].id;
 
@@ -670,7 +670,7 @@ app.get('/api/search/all', async (req, res) => {
 
 // Registrar venta de cafetería (descuenta ingredientes del inventario)
 app.post('/api/cafe/sales', async (req, res) => {
-  const { org_id, warehouse_id, items, payments, user_id, customer_id, discount_amount } = req.body;
+  const { org_id, warehouse_id, items, payments, user_id, customer_id, discount_amount, discount_notes } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -679,9 +679,9 @@ app.post('/api/cafe/sales', async (req, res) => {
     const total = Math.max(subtotal - (Number(discount_amount) || 0), 0);
 
     const saleRes = await client.query(
-      `INSERT INTO sales (org_id, warehouse_id, total, discount_amount, created_at)
-       VALUES ($1,$2,$3,$4,NOW()) RETURNING id`,
-      [org_id || 2, warehouse_id || 1, total, discount_amount || 0]
+      `INSERT INTO sales (org_id, warehouse_id, total, discount_amount, discount_notes, created_at)
+      VALUES ($1,$2,$3,$4,$5,NOW()) RETURNING id`,
+      [org_id || 1, warehouse_id || 1, totalConIva, discount_amount || 0, discount_notes || null]
     );
     const saleId = saleRes.rows[0].id;
 
@@ -2001,5 +2001,69 @@ app.delete('/api/cafe/recipe/:recipeId', async (req, res) => {
   }
 });
 
+
+// ================= VENTAS PENDIENTES (F12) =================
+
+app.get('/api/held-sales', async (req, res) => {
+  const { warehouse_id } = req.query;
+  try {
+    const result = await pool.query(
+      `SELECT hs.id, hs.label, hs.customer_name, hs.total, hs.created_at, u.name AS user_name
+       FROM held_sales hs
+       LEFT JOIN users u ON u.id = hs.user_id
+       WHERE hs.warehouse_id = $1
+       ORDER BY hs.created_at ASC`,
+      [warehouse_id || 1]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/held-sales/:id', async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT * FROM held_sales WHERE id = $1`, [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Venta pendiente no encontrada' });
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/held-sales', async (req, res) => {
+  const {
+    warehouse_id, user_id, label, cart, cafe_cart,
+    customer_id, customer_name, discount_amount, discount_notes, total,
+  } = req.body;
+  try {
+    const result = await pool.query(
+      `INSERT INTO held_sales
+       (warehouse_id, user_id, label, cart_json, cafe_cart_json, customer_id, customer_name,
+        discount_amount, discount_notes, total)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+      [warehouse_id || 1, user_id || null, label || null,
+       JSON.stringify(cart || []), JSON.stringify(cafe_cart || []),
+       customer_id || null, customer_name || null,
+       discount_amount || 0, discount_notes || null, total]
+    );
+    res.json({ success: true, id: result.rows[0].id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/held-sales/:id', async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM held_sales WHERE id = $1`, [req.params.id]);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`💻 Server corriendo en puerto ${PORT}`));
+
+
