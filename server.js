@@ -1789,7 +1789,204 @@ app.post('/api/promotions/evaluate', async (req, res) => {
   }
 });
 
+// ================= INSUMOS DE CAFETERÍA (ingredientes con inventario real) =================
 
+// Listado completo de insumos con su stock actual (incluye los que aún no tienen movimientos)
+app.get('/api/cafe/ingredients', async (req, res) => {
+  const { warehouse_id } = req.query;
+  try {
+    const result = await pool.query(
+      `SELECT p.id, p.sku, p.name, p.unit_type, p.stock_alert_limit,
+              COALESCE(i.quantity, 0) AS current_stock,
+              CASE WHEN COALESCE(i.quantity, 0) <= p.stock_alert_limit THEN true ELSE false END AS needs_reorder
+       FROM products p
+       JOIN organization_products op ON op.product_id = p.id AND op.org_id = 2
+       LEFT JOIN inventory i ON i.product_id = p.id AND i.warehouse_id = $1 AND i.org_id = 2
+       WHERE op.is_active = TRUE
+       ORDER BY p.name`,
+      [warehouse_id || 1]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Solo los que están en o por debajo de su límite de alerta
+app.get('/api/cafe/ingredients/alerts', async (req, res) => {
+  const { warehouse_id } = req.query;
+  try {
+    const result = await pool.query(
+      `SELECT p.id, p.sku, p.name, p.unit_type, p.stock_alert_limit,
+              COALESCE(i.quantity, 0) AS current_stock,
+              COALESCE(i.quantity, 0) - p.stock_alert_limit AS difference
+       FROM products p
+       JOIN organization_products op ON op.product_id = p.id AND op.org_id = 2
+       LEFT JOIN inventory i ON i.product_id = p.id AND i.warehouse_id = $1 AND i.org_id = 2
+       WHERE op.is_active = TRUE AND COALESCE(i.quantity, 0) <= p.stock_alert_limit
+       ORDER BY difference ASC`,
+      [warehouse_id || 1]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Crear un insumo nuevo (leche, café molido, vasos, tapas, popotes, jarabes...)
+app.post('/api/cafe/ingredients', async (req, res) => {
+  const { sku, name, unit_type, stock_alert_limit, initial_stock, warehouse_id, user_id } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const finalSku = sku && sku.trim() ? sku.trim() : `ING-${Date.now()}`;
+
+    const prodRes = await client.query(
+      `INSERT INTO products (sku, name, unit_type, stock_alert_limit, category)
+       VALUES ($1,$2,$3,$4,'insumo_cafeteria') RETURNING id`,
+      [finalSku, name, unit_type || 'pieza', stock_alert_limit || 5]
+    );
+    const productId = prodRes.rows[0].id;
+
+    await client.query(
+      `INSERT INTO organization_products (org_id, product_id) VALUES (2,$1)`,
+      [productId]
+    );
+
+    const startStock = Number(initial_stock) || 0;
+    if (startStock > 0) {
+      await client.query(
+        `INSERT INTO inventory (org_id, warehouse_id, product_id, quantity)
+         VALUES (2,$1,$2,$3)
+         ON CONFLICT (org_id, warehouse_id, product_id) DO UPDATE SET quantity = $3`,
+        [warehouse_id || 1, productId, startStock]
+      );
+      await client.query(
+        `INSERT INTO inventory_movements
+         (org_id, warehouse_id, product_id, movement_type, quantity, quantity_before, quantity_after, reference_type, user_id)
+         VALUES (2,$1,$2,'ajuste',$3,0,$3,'initial_stock',$4)`,
+        [warehouse_id || 1, productId, startStock, user_id || null]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({ success: true, id: productId });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.put('/api/cafe/ingredients/:id', async (req, res) => {
+  const { id } = req.params;
+  const { name, unit_type, stock_alert_limit } = req.body;
+  try {
+    await pool.query(
+      `UPDATE products SET name=$1, unit_type=$2, stock_alert_limit=$3 WHERE id=$4`,
+      [name, unit_type || 'pieza', stock_alert_limit || 5, id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Ajuste manual de stock (recepción de mercancía, corrección de conteo, etc.)
+app.post('/api/cafe/ingredients/:id/adjust-stock', async (req, res) => {
+  const { id } = req.params;
+  const { warehouse_id, quantity_change, notes, user_id } = req.body; // puede ser negativo
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const invRes = await client.query(
+      `SELECT quantity FROM inventory WHERE org_id=2 AND warehouse_id=$1 AND product_id=$2`,
+      [warehouse_id || 1, id]
+    );
+    const before = Number(invRes.rows[0]?.quantity || 0);
+    const after = before + Number(quantity_change);
+
+    await client.query(
+      `INSERT INTO inventory (org_id, warehouse_id, product_id, quantity)
+       VALUES (2,$1,$2,$3)
+       ON CONFLICT (org_id, warehouse_id, product_id) DO UPDATE SET quantity = $3, last_update = NOW()`,
+      [warehouse_id || 1, id, after]
+    );
+
+    await client.query(
+      `INSERT INTO inventory_movements
+       (org_id, warehouse_id, product_id, movement_type, quantity, quantity_before, quantity_after, reference_type, notes, user_id)
+       VALUES (2,$1,$2,'ajuste',$3,$4,$5,'manual_adjustment',$6,$7)`,
+      [warehouse_id || 1, id, Math.abs(Number(quantity_change)), before, after, notes || null, user_id || null]
+    );
+
+    await client.query('COMMIT');
+    res.json({ success: true, newStock: after });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+// ================= RECETAS (ligar bebidas con sus insumos) =================
+
+app.get('/api/cafe/products/:id/recipe', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT cr.id, cr.ingredient_product_id, cr.quantity, cr.unit,
+              p.name AS ingredient_name, p.unit_type
+       FROM cafe_recipes cr
+       JOIN products p ON p.id = cr.ingredient_product_id
+       WHERE cr.cafe_product_id = $1
+       ORDER BY p.name`,
+      [id]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/cafe/products/:id/recipe', async (req, res) => {
+  const { id } = req.params;
+  const { ingredient_product_id, quantity, unit } = req.body;
+  try {
+    const result = await pool.query(
+      `INSERT INTO cafe_recipes (cafe_product_id, ingredient_product_id, quantity, unit)
+       VALUES ($1,$2,$3,$4) RETURNING id`,
+      [id, ingredient_product_id, quantity, unit]
+    );
+    res.json({ success: true, id: result.rows[0].id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/cafe/recipe/:recipeId', async (req, res) => {
+  const { recipeId } = req.params;
+  const { quantity, unit } = req.body;
+  try {
+    await pool.query(`UPDATE cafe_recipes SET quantity=$1, unit=$2 WHERE id=$3`, [quantity, unit, recipeId]);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/cafe/recipe/:recipeId', async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM cafe_recipes WHERE id=$1`, [req.params.recipeId]);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`💻 Server corriendo en puerto ${PORT}`));
