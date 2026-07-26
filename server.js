@@ -310,7 +310,7 @@ app.put('/api/customers/:id', async (req, res) => {
 
 // ================= VENTAS =================
 app.post('/api/sales', async (req, res) => {
-  const { org_id, warehouse_id, items, payments, user_id, customer_id } = req.body;
+  const { org_id, warehouse_id, items, payments, user_id, customer_id, discount_amount } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -318,12 +318,12 @@ app.post('/api/sales', async (req, res) => {
     const subtotalVenta = items.reduce(
       (acc, item) => acc + (parseFloat(item.price) * item.quantity), 0
     );
-    const totalConIva = subtotalVenta * 1.16;
+    const totalConIva = Math.max(subtotalVenta * 1.16 - (Number(discount_amount) || 0), 0);
 
     const saleRes = await client.query(
-      `INSERT INTO sales (org_id, warehouse_id, total, created_at)
-       VALUES ($1,$2,$3,NOW()) RETURNING id`,
-      [org_id || 1, warehouse_id || 1, totalConIva]
+      `INSERT INTO sales (org_id, warehouse_id, total, discount_amount, created_at)
+       VALUES ($1,$2,$3,$4,NOW()) RETURNING id`,
+      [org_id || 1, warehouse_id || 1, totalConIva, discount_amount || 0]
     );
     const saleId = saleRes.rows[0].id;
 
@@ -670,17 +670,18 @@ app.get('/api/search/all', async (req, res) => {
 
 // Registrar venta de cafetería (descuenta ingredientes del inventario)
 app.post('/api/cafe/sales', async (req, res) => {
-  const { org_id, warehouse_id, items, payments, user_id, customer_id } = req.body;
+  const { org_id, warehouse_id, items, payments, user_id, customer_id, discount_amount } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    const total = items.reduce((acc, item) => acc + (item.final_price * item.quantity), 0);
+    const subtotal = items.reduce((acc, item) => acc + (item.final_price * item.quantity), 0);
+    const total = Math.max(subtotal - (Number(discount_amount) || 0), 0);
 
     const saleRes = await client.query(
-      `INSERT INTO sales (org_id, warehouse_id, total, created_at)
-       VALUES ($1,$2,$3,NOW()) RETURNING id`,
-      [org_id || 2, warehouse_id || 1, total]
+      `INSERT INTO sales (org_id, warehouse_id, total, discount_amount, created_at)
+       VALUES ($1,$2,$3,$4,NOW()) RETURNING id`,
+      [org_id || 2, warehouse_id || 1, total, discount_amount || 0]
     );
     const saleId = saleRes.rows[0].id;
 
@@ -1015,7 +1016,7 @@ app.get('/api/cash-cuts/summary', async (req, res) => {
 
 // Cerrar el corte con el efectivo contado físicamente
 app.post('/api/cash-cuts', async (req, res) => {
-  const { warehouse_id, user_id, counted_cash } = req.body;
+  const { warehouse_id, user_id, counted_cash, denomination_breakdown, counted_methods } = req.body;
   try {
     const lastCut = await pool.query(
       `SELECT period_end FROM cash_cuts WHERE warehouse_id = $1 ORDER BY period_end DESC LIMIT 1`,
@@ -1039,23 +1040,35 @@ app.post('/api/cash-cuts', async (req, res) => {
       [warehouse_id || 1, since]
     );
 
-    const cashMethod = byMethod.rows.find(r => r.method_name.toLowerCase().includes('efectivo'));
-    const expectedCash = Number(cashMethod?.total || 0);
-    const difference = Number(counted_cash) - expectedCash;
+    // Combina el total esperado por método con lo que el cajero confirmó contar/verificar
+    const byMethodFull = byMethod.rows.map((r) => {
+      const expected = Number(r.total);
+      const match = (counted_methods || []).find((m) => m.method_name === r.method_name);
+      const counted = match ? Number(match.counted) : expected;
+      return {
+        method_name: r.method_name,
+        total: expected,
+        counted,
+        difference: Number((counted - expected).toFixed(2)),
+      };
+    });
 
-    // org_id = NULL: este corte ya no pertenece a una sola organización,
-    // representa la caja física completa (tienda + cafetería).
+    const cashMethod = byMethodFull.find((r) => r.method_name.toLowerCase().includes('efectivo'));
+    const expectedCash = Number(cashMethod?.total || 0);
+    const difference = Number((Number(counted_cash) - expectedCash).toFixed(2));
+
     const result = await pool.query(
       `INSERT INTO cash_cuts
        (org_id, warehouse_id, user_id, period_start, period_end, sales_total,
-        payments_breakdown, counted_cash, expected_cash, difference)
-       VALUES (NULL,$1,$2,$3,NOW(),$4,$5,$6,$7,$8) RETURNING id`,
+        payments_breakdown, counted_cash, expected_cash, difference, denomination_breakdown)
+       VALUES (NULL,$1,$2,$3,NOW(),$4,$5,$6,$7,$8,$9) RETURNING id`,
       [warehouse_id || 1, user_id || null, since,
        Number(salesRes.rows[0].sales_total),
-       JSON.stringify(byMethod.rows), counted_cash, expectedCash, difference]
+       JSON.stringify(byMethodFull), counted_cash, expectedCash, difference,
+       JSON.stringify(denomination_breakdown || [])]
     );
 
-    res.json({ success: true, cutId: result.rows[0].id, expectedCash, difference });
+    res.json({ success: true, cutId: result.rows[0].id, expectedCash, difference, byMethodFull });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1554,6 +1567,228 @@ app.get('/api/reports/cafe-top-products', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// ================= PROMOCIONES =================
+
+app.get('/api/promotions', async (req, res) => {
+  const { org_id } = req.query;
+  try {
+    const result = await pool.query(
+      `SELECT * FROM promotions
+       WHERE (org_id = $1 OR org_id IS NULL)
+       ORDER BY is_active DESC, created_at DESC`,
+      [org_id || 1]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/promotions/:id', async (req, res) => {
+  try {
+    const promo = await pool.query(`SELECT * FROM promotions WHERE id = $1`, [req.params.id]);
+    if (promo.rows.length === 0) return res.status(404).json({ error: 'Promoción no encontrada' });
+
+    const items = await pool.query(
+      `SELECT pi.id, pi.product_id, pi.cafe_product_id,
+              p.name AS product_name, cp.name AS cafe_product_name
+       FROM promotion_items pi
+       LEFT JOIN products p ON p.id = pi.product_id
+       LEFT JOIN cafe_products cp ON cp.id = pi.cafe_product_id
+       WHERE pi.promotion_id = $1`,
+      [req.params.id]
+    );
+
+    res.json({ ...promo.rows[0], items: items.rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/promotions', async (req, res) => {
+  const {
+    org_id, name, description, type, discount_pct, discount_amount,
+    buy_qty, pay_qty, scope, category, start_date, end_date, days_of_week, items,
+  } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const result = await client.query(
+      `INSERT INTO promotions
+       (org_id, name, description, type, discount_pct, discount_amount, buy_qty, pay_qty,
+        scope, category, start_date, end_date, days_of_week)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+      [org_id || null, name, description || null, type, discount_pct || null, discount_amount || null,
+       buy_qty || null, pay_qty || null, scope || 'all', category || null,
+       start_date || null, end_date || null, days_of_week || null]
+    );
+    const promoId = result.rows[0].id;
+
+    for (const item of (items || [])) {
+      await client.query(
+        `INSERT INTO promotion_items (promotion_id, product_id, cafe_product_id) VALUES ($1,$2,$3)`,
+        [promoId, item.product_id || null, item.cafe_product_id || null]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({ success: true, id: promoId });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.put('/api/promotions/:id', async (req, res) => {
+  const { id } = req.params;
+  const {
+    name, description, type, discount_pct, discount_amount, buy_qty, pay_qty,
+    scope, category, start_date, end_date, days_of_week, is_active, items,
+  } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    await client.query(
+      `UPDATE promotions SET
+       name=$1, description=$2, type=$3, discount_pct=$4, discount_amount=$5,
+       buy_qty=$6, pay_qty=$7, scope=$8, category=$9, start_date=$10, end_date=$11,
+       days_of_week=$12, is_active=$13
+       WHERE id=$14`,
+      [name, description || null, type, discount_pct || null, discount_amount || null,
+       buy_qty || null, pay_qty || null, scope || 'all', category || null,
+       start_date || null, end_date || null, days_of_week || null, is_active ?? true, id]
+    );
+
+    if (items) {
+      await client.query(`DELETE FROM promotion_items WHERE promotion_id = $1`, [id]);
+      for (const item of items) {
+        await client.query(
+          `INSERT INTO promotion_items (promotion_id, product_id, cafe_product_id) VALUES ($1,$2,$3)`,
+          [id, item.product_id || null, item.cafe_product_id || null]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+    res.json({ success: true });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete('/api/promotions/:id', async (req, res) => {
+  try {
+    await pool.query(`UPDATE promotions SET is_active = FALSE WHERE id = $1`, [req.params.id]);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+app.post('/api/promotions/evaluate', async (req, res) => {
+  const { items } = req.body; // [{ type: 'store'|'cafe', id, quantity, unit_price }]
+  try {
+    const today = new Date();
+    const dayOfWeek = today.getDay(); // 0=domingo..6=sábado
+    const todayStr = today.toISOString().split('T')[0];
+
+    const promosRes = await pool.query(
+      `SELECT * FROM promotions
+       WHERE is_active = TRUE
+         AND (start_date IS NULL OR start_date <= $1)
+         AND (end_date IS NULL OR end_date >= $1)
+         AND (days_of_week IS NULL OR $2 = ANY(days_of_week))`,
+      [todayStr, dayOfWeek]
+    );
+
+    const storeIds = items.filter(i => i.type === 'store').map(i => i.id);
+    let categoryByProductId = {};
+    if (storeIds.length > 0) {
+      const catRes = await pool.query(
+        `SELECT id, category FROM products WHERE id = ANY($1::int[])`,
+        [storeIds]
+      );
+      categoryByProductId = Object.fromEntries(catRes.rows.map(r => [r.id, r.category]));
+    }
+
+    const results = [];
+
+    for (const promo of promosRes.rows) {
+      // Determinar qué items del carrito son elegibles para esta promo
+      let eligible = [];
+
+      if (promo.scope === 'all') {
+        eligible = items.filter(i => {
+          if (promo.org_id === null) return true;
+          if (promo.org_id === 1) return i.type === 'store';
+          if (promo.org_id === 2) return i.type === 'cafe';
+          return false;
+        });
+      } else if (promo.scope === 'category') {
+        eligible = items.filter(i => i.type === 'store' && categoryByProductId[i.id] === promo.category);
+      } else if (promo.scope === 'products' || promo.scope === 'cafe_products') {
+        const itemsRes = await pool.query(
+          `SELECT product_id, cafe_product_id FROM promotion_items WHERE promotion_id = $1`,
+          [promo.id]
+        );
+        const productIds = new Set(itemsRes.rows.map(r => r.product_id).filter(Boolean));
+        const cafeIds = new Set(itemsRes.rows.map(r => r.cafe_product_id).filter(Boolean));
+        eligible = items.filter(i =>
+          (i.type === 'store' && productIds.has(i.id)) || (i.type === 'cafe' && cafeIds.has(i.id))
+        );
+      }
+
+      if (eligible.length === 0) continue;
+
+      const eligibleSubtotal = eligible.reduce((acc, i) => acc + i.unit_price * i.quantity, 0);
+      let discount = 0;
+
+      if (promo.type === 'percentage') {
+        discount = eligibleSubtotal * (Number(promo.discount_pct) / 100);
+      } else if (promo.type === 'fixed_amount') {
+        discount = Math.min(Number(promo.discount_amount), eligibleSubtotal);
+      } else if (promo.type === 'nxm') {
+        // Expandir a precios individuales, ordenar de mayor a menor, agrupar en bloques de buy_qty
+        const unitPrices = eligible.flatMap(i => Array(i.quantity).fill(i.unit_price));
+        unitPrices.sort((a, b) => b - a);
+
+        const buyQty = promo.buy_qty;
+        const payQty = promo.pay_qty;
+        const freeCount = buyQty - payQty;
+
+        for (let idx = 0; idx + buyQty <= unitPrices.length; idx += buyQty) {
+          const chunk = unitPrices.slice(idx, idx + buyQty);
+          const freeItems = chunk.slice(-freeCount); // los más baratos del bloque son gratis
+          discount += freeItems.reduce((a, p) => a + p, 0);
+        }
+      }
+
+      if (discount > 0) {
+        results.push({
+          promotion_id: promo.id,
+          name: promo.name,
+          type: promo.type,
+          discount: Number(discount.toFixed(2)),
+        });
+      }
+    }
+
+    const totalDiscount = results.reduce((a, r) => a + r.discount, 0);
+    res.json({ promotions: results, total_discount: Number(totalDiscount.toFixed(2)) });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 
 
 const PORT = process.env.PORT || 3000;
