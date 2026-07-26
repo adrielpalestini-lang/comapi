@@ -678,17 +678,15 @@ app.post('/api/cafe/sales', async (req, res) => {
     const subtotal = items.reduce((acc, item) => acc + (item.final_price * item.quantity), 0);
     const total = Math.max(subtotal - (Number(discount_amount) || 0), 0);
 
-    const totalConIva = Math.max(subtotalVenta * 1.16 - (Number(discount_amount) || 0), 0);
-
     const saleRes = await client.query(
       `INSERT INTO sales (org_id, warehouse_id, total, discount_amount, discount_notes, created_at)
-      VALUES ($1,$2,$3,$4,$5,NOW()) RETURNING id`,
-      [org_id || 1, warehouse_id || 1, totalConIva, discount_amount || 0, discount_notes || null]
+       VALUES ($1,$2,$3,$4,$5,NOW()) RETURNING id`,
+      [org_id || 2, warehouse_id || 1, total, discount_amount || 0, discount_notes || null]
     );
     const saleId = saleRes.rows[0].id;
 
     for (const item of items) {
-      // Guardar el detalle de qué se vendió (esto faltaba)
+      // Guardar el detalle de qué se vendió
       await client.query(
         `INSERT INTO cafe_sale_details
          (sale_id, cafe_product_id, name, quantity, unit_price, subtotal, selected_options, notes)
@@ -749,7 +747,7 @@ app.post('/api/cafe/sales', async (req, res) => {
       );
     }
 
-    // Monedero — corregido: usa "total" (ya correcto), no la variable NaN de antes
+    // Monedero — usa "total" (ya con descuento aplicado si lo hubo)
     if (customer_id) {
       const orgRes = await client.query(`SELECT loyalty_earn_pct FROM organizations WHERE id = $1`, [org_id || 2]);
       const pct = Number(orgRes.rows[0]?.loyalty_earn_pct || 0);
@@ -777,7 +775,6 @@ app.post('/api/cafe/sales', async (req, res) => {
     client.release();
   }
 });
-
 
 // ================= CATÁLOGO CFDI =================
 app.get('/api/cfdi-catalog', async (req, res) => {
