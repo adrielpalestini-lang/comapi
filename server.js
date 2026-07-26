@@ -1793,20 +1793,33 @@ app.post('/api/promotions/evaluate', async (req, res) => {
 
 // Listado completo de insumos con su stock actual (incluye los que aún no tienen movimientos)
 app.get('/api/cafe/ingredients', async (req, res) => {
-  const { warehouse_id } = req.query;
+  const { warehouse_id, include_hidden } = req.query;
   try {
     const result = await pool.query(
-      `SELECT p.id, p.sku, p.name, p.unit_type, p.stock_alert_limit,
+      `SELECT p.id, p.sku, p.name, p.unit_type, p.stock_alert_limit, p.is_ingredient_active,
               COALESCE(i.quantity, 0) AS current_stock,
               CASE WHEN COALESCE(i.quantity, 0) <= p.stock_alert_limit THEN true ELSE false END AS needs_reorder
        FROM products p
        JOIN organization_products op ON op.product_id = p.id AND op.org_id = 2
        LEFT JOIN inventory i ON i.product_id = p.id AND i.warehouse_id = $1 AND i.org_id = 2
        WHERE op.is_active = TRUE
-       ORDER BY p.name`,
-      [warehouse_id || 1]
+         AND ($2::boolean IS TRUE OR p.is_ingredient_active = TRUE)
+       ORDER BY p.is_ingredient_active DESC, p.name`,
+      [warehouse_id || 1, include_hidden === 'true']
     );
     res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+app.put('/api/cafe/ingredients/:id/toggle-active', async (req, res) => {
+  const { id } = req.params;
+  const { is_ingredient_active } = req.body;
+  try {
+    await pool.query(`UPDATE products SET is_ingredient_active = $1 WHERE id = $2`, [is_ingredient_active, id]);
+    res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
