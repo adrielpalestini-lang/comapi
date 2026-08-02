@@ -328,11 +328,12 @@ app.post('/api/sales', async (req, res) => {
     const saleId = saleRes.rows[0].id;
 
     for (const item of items) {
-      await client.query(
+      const detailRes = await client.query(
         `INSERT INTO sale_details (sale_id, product_id, quantity, unit_price, subtotal)
-         VALUES ($1,$2,$3,$4,$5)`,
+        VALUES ($1,$2,$3,$4,$5) RETURNING id`,
         [saleId, item.id, item.quantity, item.price, item.price * item.quantity]
       );
+      const saleDetailId = detailRes.rows[0].id;
 
       const invRes = await client.query(
         `SELECT quantity FROM inventory WHERE org_id=$1 AND warehouse_id=$2 AND product_id=$3`,
@@ -349,13 +350,13 @@ app.post('/api/sales', async (req, res) => {
         [org_id || 1, warehouse_id || 1, item.id, after]
       );
 
-      await client.query(
+          await client.query(
         `INSERT INTO inventory_movements
-         (org_id, warehouse_id, product_id, movement_type, quantity,
-          quantity_before, quantity_after, unit_cost, reference_type, reference_id, user_id)
-         VALUES ($1,$2,$3,'venta',$4,$5,$6,$7,'sale',$8,$9)`,
+        (org_id, warehouse_id, product_id, movement_type, quantity,
+          quantity_before, quantity_after, unit_cost, reference_type, reference_id, user_id, sale_detail_id)
+        VALUES ($1,$2,$3,'venta',$4,$5,$6,$7,'sale',$8,$9,$10)`,
         [org_id || 1, warehouse_id || 1, item.id, item.quantity,
-         before, after, item.price, saleId, user_id || null]
+        before, after, item.price, saleId, user_id || null, saleDetailId]
       );
     }
 
@@ -686,14 +687,17 @@ app.post('/api/cafe/sales', async (req, res) => {
     const saleId = saleRes.rows[0].id;
 
     for (const item of items) {
-      // Guardar el detalle de qué se vendió
-      await client.query(
+      // Guardar el detalle de qué se vendió, capturando su id para poder
+      // ligar los movimientos de inventario y así soportar devoluciones
+      // de un solo producto específico dentro de la venta.
+      const cafeDetailRes = await client.query(
         `INSERT INTO cafe_sale_details
          (sale_id, cafe_product_id, name, quantity, unit_price, subtotal, selected_options, notes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
         [saleId, item.cafe_product_id, item.name, item.quantity, item.final_price,
          item.final_price * item.quantity, JSON.stringify(item.selected_options || []), item.notes || null]
       );
+      const cafeSaleDetailId = cafeDetailRes.rows[0].id;
 
       const recipe = await client.query(
         `SELECT ingredient_product_id, quantity, unit FROM cafe_recipes WHERE cafe_product_id = $1`,
@@ -733,9 +737,9 @@ app.post('/api/cafe/sales', async (req, res) => {
         await client.query(
           `INSERT INTO inventory_movements
            (org_id, warehouse_id, product_id, movement_type, quantity,
-            quantity_before, quantity_after, unit_cost, reference_type, reference_id, user_id)
-           VALUES ($1,$2,$3,'venta',$4,$5,$6,0,'sale',$7,$8)`,
-          [org_id || 2, warehouse_id || 1, productId, qty * item.quantity, before, after, saleId, user_id || null]
+            quantity_before, quantity_after, unit_cost, reference_type, reference_id, user_id, cafe_sale_detail_id)
+           VALUES ($1,$2,$3,'venta',$4,$5,$6,0,'sale',$7,$8,$9)`,
+          [org_id || 2, warehouse_id || 1, productId, qty * item.quantity, before, after, saleId, user_id || null, cafeSaleDetailId]
         );
       }
     }
@@ -974,10 +978,8 @@ app.put('/api/organizations/:id/loyalty-settings', async (req, res) => {
 
 // Resumen desde el último corte (o desde siempre si no hay ninguno)
 app.get('/api/cash-cuts/summary', async (req, res) => {
-  const { warehouse_id } = req.query;
+  const { warehouse_id, shift_id } = req.query;
   try {
-    // Un solo corte por caja física (warehouse), sin importar si la venta
-    // fue de tienda (org 1) o cafetería (org 2) — es el mismo cajón.
     const lastCut = await pool.query(
       `SELECT period_end FROM cash_cuts WHERE warehouse_id = $1 ORDER BY period_end DESC LIMIT 1`,
       [warehouse_id || 1]
@@ -1002,17 +1004,38 @@ app.get('/api/cash-cuts/summary', async (req, res) => {
       [warehouse_id || 1, since]
     );
 
+    // Devoluciones registradas desde el último corte, sin importar la fecha
+    // de la venta original — se descuentan del efectivo esperado.
+    const returnsRes = await pool.query(
+      `SELECT COALESCE(SUM(amount), 0) AS total FROM sale_returns WHERE warehouse_id = $1 AND created_at > $2`,
+      [warehouse_id || 1, since]
+    );
+    const returnsTotal = Number(returnsRes.rows[0].total);
+
+    const byMethodNet = byMethod.rows.map(r => {
+      const isCash = r.method_name.toLowerCase().includes('efectivo');
+      const total = Number(r.total);
+      return { method_name: r.method_name, total: isCash ? Math.max(total - returnsTotal, 0) : total };
+    });
+
+    let openingFund = 0;
+    if (shift_id) {
+      const shiftRes = await pool.query(`SELECT opening_fund FROM cash_shifts WHERE id = $1`, [shift_id]);
+      openingFund = Number(shiftRes.rows[0]?.opening_fund || 0);
+    }
+
     res.json({
       period_start: since,
       sales_total: Number(salesRes.rows[0].sales_total),
       sale_count: Number(salesRes.rows[0].sale_count),
-      by_method: byMethod.rows.map(r => ({ method_name: r.method_name, total: Number(r.total) })),
+      by_method: byMethodNet,
+      opening_fund: openingFund,
+      returns_total: returnsTotal,
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
-
 // Cerrar el corte con el efectivo contado físicamente
 app.post('/api/cash-cuts', async (req, res) => {
   const {
@@ -1045,8 +1068,18 @@ app.post('/api/cash-cuts', async (req, res) => {
       [warehouse_id || 1, since]
     );
 
+    // Devoluciones del período — se restan del efectivo, sin importar la
+    // fecha de la venta original que se devolvió.
+    const returnsRes = await client.query(
+      `SELECT COALESCE(SUM(amount), 0) AS total FROM sale_returns WHERE warehouse_id = $1 AND created_at > $2`,
+      [warehouse_id || 1, since]
+    );
+    const returnsTotal = Number(returnsRes.rows[0].total);
+
     const byMethodFull = byMethod.rows.map((r) => {
-      const expected = Number(r.total);
+      const isCash = r.method_name.toLowerCase().includes('efectivo');
+      const expectedRaw = Number(r.total);
+      const expected = isCash ? Math.max(expectedRaw - returnsTotal, 0) : expectedRaw;
       const match = (counted_methods || []).find((m) => m.method_name === r.method_name);
       const counted = match ? Number(match.counted) : expected;
       return { method_name: r.method_name, total: expected, counted, difference: Number((counted - expected).toFixed(2)) };
@@ -1055,14 +1088,12 @@ app.post('/api/cash-cuts', async (req, res) => {
     const cashMethod = byMethodFull.find((r) => r.method_name.toLowerCase().includes('efectivo'));
     const expectedCash = Number(cashMethod?.total || 0);
 
-    // Obtener el fondo del turno actual para restarlo del efectivo contado
     let openingFund = 0;
     if (shift_id) {
       const shiftRes = await client.query(`SELECT opening_fund FROM cash_shifts WHERE id = $1`, [shift_id]);
       openingFund = Number(shiftRes.rows[0]?.opening_fund || 0);
     }
 
-    // El "efectivo esperado real" incluye el fondo que ya estaba en la caja desde el inicio
     const expectedCashWithFund = Number((expectedCash + openingFund).toFixed(2));
     const difference = Number((Number(counted_cash) - expectedCashWithFund).toFixed(2));
 
@@ -1078,7 +1109,6 @@ app.post('/api/cash-cuts', async (req, res) => {
     );
     const cutId = cutResult.rows[0].id;
 
-    // Cerrar el turno actual
     if (shift_id) {
       const carried = fund_action === 'carry';
       const finalNextFund = carried ? openingFund : Number(next_opening_fund || 0);
@@ -1095,7 +1125,7 @@ app.post('/api/cash-cuts', async (req, res) => {
     await client.query('COMMIT');
     res.json({
       success: true, cutId, expectedCash: expectedCashWithFund, difference,
-      openingFund, byMethodFull,
+      openingFund, returnsTotal, byMethodFull,
     });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -2275,6 +2305,178 @@ app.get('/api/sales/:id/detail', async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+
+// ================= CANCELACIONES Y DEVOLUCIONES =================
+
+// Cancelar TODA la venta — revierte todo el inventario asociado
+app.post('/api/sales/:id/cancel', async (req, res) => {
+  const { id } = req.params;
+  const { reason, user_id, warehouse_id } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const saleRes = await client.query(`SELECT * FROM sales WHERE id = $1`, [id]);
+    if (saleRes.rows.length === 0) throw new Error('Venta no encontrada');
+    const sale = saleRes.rows[0];
+    if (sale.is_cancelled) throw new Error('Esta venta ya fue cancelada anteriormente');
+
+    // Revertir todos los movimientos de inventario ligados a esta venta
+    const movements = await client.query(
+      `SELECT * FROM inventory_movements WHERE reference_type = 'sale' AND reference_id = $1`,
+      [id]
+    );
+
+    for (const m of movements.rows) {
+      const invRes = await client.query(
+        `SELECT quantity FROM inventory WHERE org_id=$1 AND warehouse_id=$2 AND product_id=$3`,
+        [m.org_id, m.warehouse_id, m.product_id]
+      );
+      const before = parseFloat(invRes.rows[0]?.quantity || 0);
+      const after = before + Number(m.quantity);
+
+      await client.query(
+        `INSERT INTO inventory (org_id, warehouse_id, product_id, quantity)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (org_id, warehouse_id, product_id) DO UPDATE SET quantity = $4, last_update = NOW()`,
+        [m.org_id, m.warehouse_id, m.product_id, after]
+      );
+
+      await client.query(
+        `INSERT INTO inventory_movements
+         (org_id, warehouse_id, product_id, movement_type, quantity, quantity_before, quantity_after,
+          reference_type, reference_id, user_id, notes)
+         VALUES ($1,$2,$3,'devolucion',$4,$5,$6,'return',$7,$8,$9)`,
+        [m.org_id, m.warehouse_id, m.product_id, m.quantity, before, after, id, user_id || null, `Cancelación total: ${reason}`]
+      );
+    }
+
+    await client.query(`UPDATE sales SET is_cancelled = TRUE WHERE id = $1`, [id]);
+
+    await client.query(
+      `INSERT INTO sale_returns (original_sale_id, warehouse_id, return_type, amount, reason, user_id)
+       VALUES ($1,$2,'full',$3,$4,$5)`,
+      [id, warehouse_id || sale.warehouse_id || 1, sale.total, reason, user_id || null]
+    );
+
+    await client.query('COMMIT');
+    res.json({ success: true });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Devolver UN producto específico de la venta (parcial)
+app.post('/api/sales/:id/items/return', async (req, res) => {
+  const { id } = req.params;
+  const {
+    sale_detail_id, cafe_sale_detail_id, quantity, reason, user_id, warehouse_id,
+  } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    let amount = 0;
+    let orgIdForFund = null;
+
+    if (sale_detail_id) {
+      const lineRes = await client.query(`SELECT * FROM sale_details WHERE id = $1 AND sale_id = $2`, [sale_detail_id, id]);
+      if (lineRes.rows.length === 0) throw new Error('Producto no encontrado en esta venta');
+      const line = lineRes.rows[0];
+      const remaining = Number(line.quantity) - Number(line.returned_quantity);
+      if (quantity > remaining) throw new Error(`Solo quedan ${remaining} unidades disponibles para devolver`);
+
+      amount = Number(line.unit_price) * quantity;
+      await client.query(`UPDATE sale_details SET returned_quantity = returned_quantity + $1 WHERE id = $2`, [quantity, sale_detail_id]);
+
+      const movRes = await client.query(
+        `SELECT * FROM inventory_movements WHERE sale_detail_id = $1 LIMIT 1`,
+        [sale_detail_id]
+      );
+      if (movRes.rows.length > 0) {
+        const m = movRes.rows[0];
+        orgIdForFund = m.org_id;
+        const invRes = await client.query(
+          `SELECT quantity FROM inventory WHERE org_id=$1 AND warehouse_id=$2 AND product_id=$3`,
+          [m.org_id, m.warehouse_id, m.product_id]
+        );
+        const before = parseFloat(invRes.rows[0]?.quantity || 0);
+        const after = before + Number(quantity);
+        await client.query(
+          `INSERT INTO inventory (org_id, warehouse_id, product_id, quantity)
+           VALUES ($1,$2,$3,$4)
+           ON CONFLICT (org_id, warehouse_id, product_id) DO UPDATE SET quantity = $4, last_update = NOW()`,
+          [m.org_id, m.warehouse_id, m.product_id, after]
+        );
+        await client.query(
+          `INSERT INTO inventory_movements
+           (org_id, warehouse_id, product_id, movement_type, quantity, quantity_before, quantity_after,
+            reference_type, reference_id, user_id, sale_detail_id, notes)
+           VALUES ($1,$2,$3,'devolucion',$4,$5,$6,'return',$7,$8,$9,$10)`,
+          [m.org_id, m.warehouse_id, m.product_id, quantity, before, after, id, user_id || null, sale_detail_id, reason]
+        );
+      }
+    } else if (cafe_sale_detail_id) {
+      const lineRes = await client.query(`SELECT * FROM cafe_sale_details WHERE id = $1 AND sale_id = $2`, [cafe_sale_detail_id, id]);
+      if (lineRes.rows.length === 0) throw new Error('Producto no encontrado en esta venta');
+      const line = lineRes.rows[0];
+      const remaining = Number(line.quantity) - Number(line.returned_quantity);
+      if (quantity > remaining) throw new Error(`Solo quedan ${remaining} unidades disponibles para devolver`);
+
+      amount = Number(line.unit_price) * quantity;
+      await client.query(`UPDATE cafe_sale_details SET returned_quantity = returned_quantity + $1 WHERE id = $2`, [quantity, cafe_sale_detail_id]);
+
+      const movs = await client.query(
+        `SELECT * FROM inventory_movements WHERE cafe_sale_detail_id = $1`,
+        [cafe_sale_detail_id]
+      );
+      const ratio = quantity / Number(line.quantity);
+      for (const m of movs.rows) {
+        orgIdForFund = m.org_id;
+        const qtyBack = Number(m.quantity) * ratio;
+        const invRes = await client.query(
+          `SELECT quantity FROM inventory WHERE org_id=$1 AND warehouse_id=$2 AND product_id=$3`,
+          [m.org_id, m.warehouse_id, m.product_id]
+        );
+        const before = parseFloat(invRes.rows[0]?.quantity || 0);
+        const after = before + qtyBack;
+        await client.query(
+          `INSERT INTO inventory (org_id, warehouse_id, product_id, quantity)
+           VALUES ($1,$2,$3,$4)
+           ON CONFLICT (org_id, warehouse_id, product_id) DO UPDATE SET quantity = $4, last_update = NOW()`,
+          [m.org_id, m.warehouse_id, m.product_id, after]
+        );
+        await client.query(
+          `INSERT INTO inventory_movements
+           (org_id, warehouse_id, product_id, movement_type, quantity, quantity_before, quantity_after,
+            reference_type, reference_id, user_id, cafe_sale_detail_id, notes)
+           VALUES ($1,$2,$3,'devolucion',$4,$5,$6,'return',$7,$8,$9,$10)`,
+          [m.org_id, m.warehouse_id, m.product_id, qtyBack, before, after, id, user_id || null, cafe_sale_detail_id, reason]
+        );
+      }
+    } else {
+      throw new Error('Falta indicar el producto a devolver');
+    }
+
+    await client.query(
+      `INSERT INTO sale_returns (original_sale_id, warehouse_id, return_type, amount, reason, user_id)
+       VALUES ($1,$2,'partial',$3,$4,$5)`,
+      [id, warehouse_id || 1, amount, reason, user_id || null]
+    );
+
+    await client.query('COMMIT');
+    res.json({ success: true, amount });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
   }
 });
 
