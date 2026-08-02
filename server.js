@@ -1015,21 +1015,27 @@ app.get('/api/cash-cuts/summary', async (req, res) => {
 
 // Cerrar el corte con el efectivo contado físicamente
 app.post('/api/cash-cuts', async (req, res) => {
-  const { warehouse_id, user_id, counted_cash, denomination_breakdown, counted_methods } = req.body;
+  const {
+    warehouse_id, user_id, counted_cash, denomination_breakdown, counted_methods,
+    shift_id, fund_action, next_opening_fund,
+  } = req.body;
+  const client = await pool.connect();
   try {
-    const lastCut = await pool.query(
+    await client.query('BEGIN');
+
+    const lastCut = await client.query(
       `SELECT period_end FROM cash_cuts WHERE warehouse_id = $1 ORDER BY period_end DESC LIMIT 1`,
       [warehouse_id || 1]
     );
     const since = lastCut.rows[0]?.period_end || '1970-01-01';
 
-    const salesRes = await pool.query(
+    const salesRes = await client.query(
       `SELECT COALESCE(SUM(s.total), 0) AS sales_total
        FROM sales s WHERE s.warehouse_id = $1 AND s.created_at > $2`,
       [warehouse_id || 1, since]
     );
 
-    const byMethod = await pool.query(
+    const byMethod = await client.query(
       `SELECT pm.name AS method_name, COALESCE(SUM(sp.amount), 0) AS total
        FROM sale_payments sp
        JOIN sales s ON s.id = sp.sale_id
@@ -1039,37 +1045,63 @@ app.post('/api/cash-cuts', async (req, res) => {
       [warehouse_id || 1, since]
     );
 
-    // Combina el total esperado por método con lo que el cajero confirmó contar/verificar
     const byMethodFull = byMethod.rows.map((r) => {
       const expected = Number(r.total);
       const match = (counted_methods || []).find((m) => m.method_name === r.method_name);
       const counted = match ? Number(match.counted) : expected;
-      return {
-        method_name: r.method_name,
-        total: expected,
-        counted,
-        difference: Number((counted - expected).toFixed(2)),
-      };
+      return { method_name: r.method_name, total: expected, counted, difference: Number((counted - expected).toFixed(2)) };
     });
 
     const cashMethod = byMethodFull.find((r) => r.method_name.toLowerCase().includes('efectivo'));
     const expectedCash = Number(cashMethod?.total || 0);
-    const difference = Number((Number(counted_cash) - expectedCash).toFixed(2));
 
-    const result = await pool.query(
+    // Obtener el fondo del turno actual para restarlo del efectivo contado
+    let openingFund = 0;
+    if (shift_id) {
+      const shiftRes = await client.query(`SELECT opening_fund FROM cash_shifts WHERE id = $1`, [shift_id]);
+      openingFund = Number(shiftRes.rows[0]?.opening_fund || 0);
+    }
+
+    // El "efectivo esperado real" incluye el fondo que ya estaba en la caja desde el inicio
+    const expectedCashWithFund = Number((expectedCash + openingFund).toFixed(2));
+    const difference = Number((Number(counted_cash) - expectedCashWithFund).toFixed(2));
+
+    const cutResult = await client.query(
       `INSERT INTO cash_cuts
        (org_id, warehouse_id, user_id, period_start, period_end, sales_total,
-        payments_breakdown, counted_cash, expected_cash, difference, denomination_breakdown)
-       VALUES (NULL,$1,$2,$3,NOW(),$4,$5,$6,$7,$8,$9) RETURNING id`,
+        payments_breakdown, counted_cash, expected_cash, difference, denomination_breakdown, shift_id)
+       VALUES (NULL,$1,$2,$3,NOW(),$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
       [warehouse_id || 1, user_id || null, since,
        Number(salesRes.rows[0].sales_total),
-       JSON.stringify(byMethodFull), counted_cash, expectedCash, difference,
-       JSON.stringify(denomination_breakdown || [])]
+       JSON.stringify(byMethodFull), counted_cash, expectedCashWithFund, difference,
+       JSON.stringify(denomination_breakdown || []), shift_id || null]
     );
+    const cutId = cutResult.rows[0].id;
 
-    res.json({ success: true, cutId: result.rows[0].id, expectedCash, difference, byMethodFull });
+    // Cerrar el turno actual
+    if (shift_id) {
+      const carried = fund_action === 'carry';
+      const finalNextFund = carried ? openingFund : Number(next_opening_fund || 0);
+
+      await client.query(
+        `UPDATE cash_shifts
+         SET status='closed', closed_at=NOW(), closed_by_user_id=$1,
+             fund_carried=$2, next_opening_fund=$3, cash_cut_id=$4
+         WHERE id=$5`,
+        [user_id || null, carried, finalNextFund, cutId, shift_id]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.json({
+      success: true, cutId, expectedCash: expectedCashWithFund, difference,
+      openingFund, byMethodFull,
+    });
   } catch (error) {
+    await client.query('ROLLBACK');
     res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -2056,6 +2088,191 @@ app.delete('/api/held-sales/:id', async (req, res) => {
   try {
     await pool.query(`DELETE FROM held_sales WHERE id = $1`, [req.params.id]);
     res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+// ================= TURNOS / FONDO DE CAJA =================
+
+// Consulta si hay turno abierto, y si no, sugiere el fondo del último turno cerrado
+app.get('/api/cash-shifts/current', async (req, res) => {
+  const { warehouse_id } = req.query;
+  try {
+    const openShift = await pool.query(
+      `SELECT cs.*, u.name AS opened_by_name
+       FROM cash_shifts cs
+       LEFT JOIN users u ON u.id = cs.opened_by_user_id
+       WHERE cs.warehouse_id = $1 AND cs.status = 'open'
+       ORDER BY cs.opened_at DESC LIMIT 1`,
+      [warehouse_id || 1]
+    );
+
+    if (openShift.rows.length > 0) {
+      return res.json({ is_open: true, shift: openShift.rows[0], suggested_fund: null });
+    }
+
+    const lastClosed = await pool.query(
+      `SELECT next_opening_fund FROM cash_shifts
+       WHERE warehouse_id = $1 AND status = 'closed'
+       ORDER BY closed_at DESC LIMIT 1`,
+      [warehouse_id || 1]
+    );
+
+    res.json({
+      is_open: false,
+      shift: null,
+      suggested_fund: lastClosed.rows[0]?.next_opening_fund ?? null,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/cash-shifts/open', async (req, res) => {
+  const { warehouse_id, user_id, opening_fund } = req.body;
+  try {
+    if (!opening_fund || Number(opening_fund) <= 0) {
+      return res.status(400).json({ error: 'El fondo debe ser mayor a $0 para operar la caja.' });
+    }
+
+    const existing = await pool.query(
+      `SELECT id FROM cash_shifts WHERE warehouse_id = $1 AND status = 'open'`,
+      [warehouse_id || 1]
+    );
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: 'Ya hay un turno abierto en esta caja.' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO cash_shifts (warehouse_id, opened_by_user_id, opening_fund, status)
+       VALUES ($1,$2,$3,'open') RETURNING id`,
+      [warehouse_id || 1, user_id || null, opening_fund]
+    );
+    res.json({ success: true, shift_id: result.rows[0].id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ================= CONSULTA DE TICKETS =================
+
+app.get('/api/sales/search', async (req, res) => {
+  const { warehouse_id, folio, date, customer_search, mode, limit } = req.query;
+  const lim = Number(limit) || 20;
+  try {
+    let query;
+    let params;
+
+    if (folio) {
+      query = `
+        SELECT s.id, s.org_id, o.name AS org_name, s.total, s.discount_amount, s.created_at, c.name AS customer_name
+        FROM sales s
+        JOIN organizations o ON o.id = s.org_id
+        LEFT JOIN customers c ON c.id = (
+          SELECT customer_id FROM customer_wallet_movements WHERE sale_id = s.id LIMIT 1
+        )
+        WHERE s.warehouse_id = $1 AND s.id = $2`;
+      params = [warehouse_id || 1, folio];
+    } else if (date) {
+      query = `
+        SELECT s.id, s.org_id, o.name AS org_name, s.total, s.discount_amount, s.created_at, c.name AS customer_name
+        FROM sales s
+        JOIN organizations o ON o.id = s.org_id
+        LEFT JOIN customers c ON c.id = (
+          SELECT customer_id FROM customer_wallet_movements WHERE sale_id = s.id LIMIT 1
+        )
+        WHERE s.warehouse_id = $1 AND DATE(s.created_at) = $2
+        ORDER BY s.created_at DESC`;
+      params = [warehouse_id || 1, date];
+    } else if (customer_search) {
+      query = `
+        SELECT s.id, s.org_id, o.name AS org_name, s.total, s.discount_amount, s.created_at, c.name AS customer_name
+        FROM sales s
+        JOIN organizations o ON o.id = s.org_id
+        JOIN customer_wallet_movements cwm ON cwm.sale_id = s.id
+        JOIN customers c ON c.id = cwm.customer_id
+        LEFT JOIN customer_phones cp ON cp.customer_id = c.id
+        WHERE s.warehouse_id = $1 AND (c.name ILIKE $2 OR cp.phone ILIKE $2)
+        ORDER BY s.created_at DESC LIMIT $3`;
+      params = [warehouse_id || 1, `%${customer_search}%`, lim];
+    } else if (mode === 'top') {
+      query = `
+        SELECT s.id, s.org_id, o.name AS org_name, s.total, s.discount_amount, s.created_at, c.name AS customer_name
+        FROM sales s
+        JOIN organizations o ON o.id = s.org_id
+        LEFT JOIN customers c ON c.id = (
+          SELECT customer_id FROM customer_wallet_movements WHERE sale_id = s.id LIMIT 1
+        )
+        WHERE s.warehouse_id = $1
+        ORDER BY s.total DESC LIMIT $2`;
+      params = [warehouse_id || 1, lim];
+    } else {
+      query = `
+        SELECT s.id, s.org_id, o.name AS org_name, s.total, s.discount_amount, s.created_at, c.name AS customer_name
+        FROM sales s
+        JOIN organizations o ON o.id = s.org_id
+        LEFT JOIN customers c ON c.id = (
+          SELECT customer_id FROM customer_wallet_movements WHERE sale_id = s.id LIMIT 1
+        )
+        WHERE s.warehouse_id = $1
+        ORDER BY s.created_at DESC LIMIT $2`;
+      params = [warehouse_id || 1, lim];
+    }
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/sales/:id/detail', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const saleRes = await pool.query(
+      `SELECT s.*, o.name AS org_name
+       FROM sales s JOIN organizations o ON o.id = s.org_id
+       WHERE s.id = $1`,
+      [id]
+    );
+    if (saleRes.rows.length === 0) return res.status(404).json({ error: 'Venta no encontrada' });
+    const sale = saleRes.rows[0];
+
+    const normalItems = await pool.query(
+      `SELECT sd.quantity, sd.unit_price, sd.subtotal, p.name
+       FROM sale_details sd JOIN products p ON p.id = sd.product_id
+       WHERE sd.sale_id = $1`,
+      [id]
+    );
+
+    const cafeItems = await pool.query(
+      `SELECT quantity, unit_price, subtotal, name, selected_options, notes
+       FROM cafe_sale_details WHERE sale_id = $1`,
+      [id]
+    );
+
+    const payments = await pool.query(
+      `SELECT sp.amount, pm.name AS method_name
+       FROM sale_payments sp JOIN payment_methods pm ON pm.id = sp.payment_method_id
+       WHERE sp.sale_id = $1`,
+      [id]
+    );
+
+    const customerRes = await pool.query(
+      `SELECT c.id, c.name FROM customer_wallet_movements cwm
+       JOIN customers c ON c.id = cwm.customer_id
+       WHERE cwm.sale_id = $1 LIMIT 1`,
+      [id]
+    );
+
+    res.json({
+      sale,
+      items: [...normalItems.rows, ...cafeItems.rows],
+      payments: payments.rows,
+      customer: customerRes.rows[0] || null,
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
