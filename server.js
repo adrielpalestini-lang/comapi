@@ -2481,6 +2481,50 @@ app.post('/api/sales/:id/items/return', async (req, res) => {
 });
 
 
+// Verificador de precio — para mostrar al cliente en pantalla grande (solo tienda, org 1)
+app.get('/api/products/verify/:sku', async (req, res) => {
+  const { sku } = req.params;
+  const { org_id, warehouse_id } = req.query;
+  try {
+    const result = await pool.query(
+      `SELECT p.id, p.sku, p.name, p.description, p.unit_type,
+              vf.price_with_tax AS price,
+              COALESCE(i.quantity, 0) AS stock,
+              w.name AS warehouse_name
+       FROM products p
+       JOIN v_products_full vf ON vf.id = p.id AND vf.org_id = $2
+       LEFT JOIN inventory i ON i.product_id = p.id AND i.org_id = $2 AND i.warehouse_id = $3
+       LEFT JOIN warehouses w ON w.id = $3
+       WHERE p.sku = $1 AND vf.is_active = TRUE`,
+      [sku, org_id || 1, warehouse_id || 1]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Producto no encontrado' });
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Búsqueda por nombre (para cuando no se escanea código)
+app.get('/api/products/verify-search', async (req, res) => {
+  const { q, org_id } = req.query;
+  if (!q || q.trim().length < 2) return res.json([]);
+  try {
+    const result = await pool.query(
+      `SELECT id, sku, name FROM v_products_full
+       WHERE org_id = $1 AND is_active = TRUE AND name ILIKE $2
+       ORDER BY name LIMIT 8`,
+      [org_id || 1, `%${q.trim()}%`]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`💻 Server corriendo en puerto ${PORT}`));
 
