@@ -988,8 +988,7 @@ app.get('/api/cash-cuts/summary', async (req, res) => {
 
     const salesRes = await pool.query(
       `SELECT COALESCE(SUM(s.total), 0) AS sales_total, COUNT(*) AS sale_count
-       FROM sales s
-       WHERE s.warehouse_id = $1 AND s.created_at > $2`,
+       FROM sales s WHERE s.warehouse_id = $1 AND s.created_at > $2`,
       [warehouse_id || 1, since]
     );
 
@@ -999,24 +998,15 @@ app.get('/api/cash-cuts/summary', async (req, res) => {
        JOIN sales s ON s.id = sp.sale_id
        JOIN payment_methods pm ON pm.id = sp.payment_method_id
        WHERE s.warehouse_id = $1 AND s.created_at > $2
-       GROUP BY pm.name
-       ORDER BY pm.name`,
+       GROUP BY pm.name ORDER BY pm.name`,
       [warehouse_id || 1, since]
     );
 
-    // Devoluciones registradas desde el último corte, sin importar la fecha
-    // de la venta original — se descuentan del efectivo esperado.
     const returnsRes = await pool.query(
       `SELECT COALESCE(SUM(amount), 0) AS total FROM sale_returns WHERE warehouse_id = $1 AND created_at > $2`,
       [warehouse_id || 1, since]
     );
     const returnsTotal = Number(returnsRes.rows[0].total);
-
-    const byMethodNet = byMethod.rows.map(r => {
-      const isCash = r.method_name.toLowerCase().includes('efectivo');
-      const total = Number(r.total);
-      return { method_name: r.method_name, total: isCash ? Math.max(total - returnsTotal, 0) : total };
-    });
 
     let openingFund = 0;
     if (shift_id) {
@@ -1024,13 +1014,57 @@ app.get('/api/cash-cuts/summary', async (req, res) => {
       openingFund = Number(shiftRes.rows[0]?.opening_fund || 0);
     }
 
+    // Ventas netas de devoluciones, por método
+    const netByMethod = byMethod.rows.map(r => {
+      const isCash = r.method_name.toLowerCase().includes('efectivo');
+      const total = Number(r.total);
+      return { method_name: r.method_name, total: isCash ? Math.max(total - returnsTotal, 0) : total };
+    });
+
+    // Efectivo esperado = ventas en efectivo (netas) + fondo de caja
+    const cashIdx = netByMethod.findIndex(m => m.method_name.toLowerCase().includes('efectivo'));
+    const cashWithFund = (cashIdx >= 0 ? netByMethod[cashIdx].total : 0) + openingFund;
+
+    // Egresos aplicados y aún no cubiertos por completo (más antiguos primero)
+    const expensesRes = await pool.query(
+      `SELECT id, concept, amount, remaining_amount, applied_at
+       FROM expenses
+       WHERE warehouse_id = $1 AND status = 'applied' AND remaining_amount > 0
+       ORDER BY applied_at ASC`,
+      [warehouse_id || 1]
+    );
+    const egressTotal = expensesRes.rows.reduce((a, e) => a + Number(e.remaining_amount), 0);
+
+    // Descuenta primero del efectivo, luego del resto de métodos, solo lo disponible
+    let egressPool = egressTotal;
+    const deductFromCash = Math.min(cashWithFund, egressPool);
+    const cashFinal = cashWithFund - deductFromCash;
+    egressPool -= deductFromCash;
+
+    const finalByMethod = netByMethod.map((m, idx) => {
+      if (idx === cashIdx) return { ...m, total: cashFinal };
+      if (egressPool <= 0) return m;
+      const deduct = Math.min(m.total, egressPool);
+      egressPool -= deduct;
+      return { ...m, total: m.total - deduct };
+    });
+
+    const egressCovered = egressTotal - egressPool;
+    const egressUncovered = egressPool;
+
     res.json({
       period_start: since,
       sales_total: Number(salesRes.rows[0].sales_total),
       sale_count: Number(salesRes.rows[0].sale_count),
-      by_method: byMethodNet,
+      by_method: finalByMethod,
       opening_fund: openingFund,
       returns_total: returnsTotal,
+      expenses: expensesRes.rows.map(e => ({
+        id: e.id, concept: e.concept, amount: Number(e.amount), remaining_amount: Number(e.remaining_amount),
+      })),
+      egress_total: egressTotal,
+      egress_covered: egressCovered,
+      egress_uncovered: egressUncovered,
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1068,25 +1102,11 @@ app.post('/api/cash-cuts', async (req, res) => {
       [warehouse_id || 1, since]
     );
 
-    // Devoluciones del período — se restan del efectivo, sin importar la
-    // fecha de la venta original que se devolvió.
     const returnsRes = await client.query(
       `SELECT COALESCE(SUM(amount), 0) AS total FROM sale_returns WHERE warehouse_id = $1 AND created_at > $2`,
       [warehouse_id || 1, since]
     );
     const returnsTotal = Number(returnsRes.rows[0].total);
-
-    const byMethodFull = byMethod.rows.map((r) => {
-      const isCash = r.method_name.toLowerCase().includes('efectivo');
-      const expectedRaw = Number(r.total);
-      const expected = isCash ? Math.max(expectedRaw - returnsTotal, 0) : expectedRaw;
-      const match = (counted_methods || []).find((m) => m.method_name === r.method_name);
-      const counted = match ? Number(match.counted) : expected;
-      return { method_name: r.method_name, total: expected, counted, difference: Number((counted - expected).toFixed(2)) };
-    });
-
-    const cashMethod = byMethodFull.find((r) => r.method_name.toLowerCase().includes('efectivo'));
-    const expectedCash = Number(cashMethod?.total || 0);
 
     let openingFund = 0;
     if (shift_id) {
@@ -1094,7 +1114,60 @@ app.post('/api/cash-cuts', async (req, res) => {
       openingFund = Number(shiftRes.rows[0]?.opening_fund || 0);
     }
 
-    const expectedCashWithFund = Number((expectedCash + openingFund).toFixed(2));
+    const netByMethod = byMethod.rows.map(r => {
+      const isCash = r.method_name.toLowerCase().includes('efectivo');
+      const total = Number(r.total);
+      return { method_name: r.method_name, total: isCash ? Math.max(total - returnsTotal, 0) : total };
+    });
+    const cashIdx = netByMethod.findIndex(m => m.method_name.toLowerCase().includes('efectivo'));
+    const cashWithFund = (cashIdx >= 0 ? netByMethod[cashIdx].total : 0) + openingFund;
+
+    // Egresos aplicados pendientes de cubrir, más antiguos primero
+    const expensesRes = await client.query(
+      `SELECT id, remaining_amount FROM expenses
+       WHERE warehouse_id = $1 AND status = 'applied' AND remaining_amount > 0
+       ORDER BY applied_at ASC`,
+      [warehouse_id || 1]
+    );
+    const egressTotal = expensesRes.rows.reduce((a, e) => a + Number(e.remaining_amount), 0);
+
+    let egressPool = egressTotal;
+    const deductFromCash = Math.min(cashWithFund, egressPool);
+    const cashFinal = cashWithFund - deductFromCash;
+    egressPool -= deductFromCash;
+
+    const byMethodFull = netByMethod.map((m, idx) => {
+      let finalTotal = m.total;
+      if (idx === cashIdx) {
+        finalTotal = cashFinal;
+      } else if (egressPool > 0) {
+        const deduct = Math.min(m.total, egressPool);
+        egressPool -= deduct;
+        finalTotal = m.total - deduct;
+      }
+      const match = (counted_methods || []).find((cm) => cm.method_name === m.method_name);
+      const counted = idx === cashIdx ? undefined : (match ? Number(match.counted) : finalTotal);
+      return {
+        method_name: m.method_name,
+        total: finalTotal,
+        counted: idx === cashIdx ? undefined : counted,
+        difference: idx === cashIdx ? undefined : Number(((counted ?? finalTotal) - finalTotal).toFixed(2)),
+      };
+    });
+
+    const egressActuallyCovered = egressTotal - egressPool;
+
+    // Consume el remaining_amount de cada egreso, más antiguo primero, con lo que sí se cubrió
+    let poolToConsume = egressActuallyCovered;
+    for (const exp of expensesRes.rows) {
+      if (poolToConsume <= 0) break;
+      const remaining = Number(exp.remaining_amount);
+      const consume = Math.min(remaining, poolToConsume);
+      await client.query(`UPDATE expenses SET remaining_amount = remaining_amount - $1 WHERE id = $2`, [consume, exp.id]);
+      poolToConsume -= consume;
+    }
+
+    const expectedCashWithFund = cashFinal;
     const difference = Number((Number(counted_cash) - expectedCashWithFund).toFixed(2));
 
     const cutResult = await client.query(
@@ -1125,7 +1198,7 @@ app.post('/api/cash-cuts', async (req, res) => {
     await client.query('COMMIT');
     res.json({
       success: true, cutId, expectedCash: expectedCashWithFund, difference,
-      openingFund, returnsTotal, byMethodFull,
+      openingFund, returnsTotal, egressCovered: egressActuallyCovered, byMethodFull,
     });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -2524,6 +2597,86 @@ app.get('/api/products/verify-search', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+
+// ================= EGRESOS =================
+
+app.get('/api/expense-concepts', async (req, res) => {
+  const { q } = req.query;
+  try {
+    const result = q
+      ? await pool.query(`SELECT name FROM expense_concepts WHERE name ILIKE $1 ORDER BY name LIMIT 8`, [`%${q}%`])
+      : await pool.query(`SELECT name FROM expense_concepts ORDER BY name LIMIT 20`);
+    res.json(result.rows.map(r => r.name));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/expenses', async (req, res) => {
+  const { warehouse_id, concept, amount, user_id, apply_now } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    await client.query(
+      `INSERT INTO expense_concepts (name) VALUES ($1) ON CONFLICT (name) DO NOTHING`,
+      [concept]
+    );
+
+    const result = await client.query(
+      `INSERT INTO expenses (warehouse_id, concept, amount, remaining_amount, status, applied_at, user_id)
+       VALUES ($1,$2,$3,$3,$4,$5,$6) RETURNING id`,
+      [warehouse_id || 1, concept, amount, apply_now ? 'applied' : 'pending', apply_now ? new Date() : null, user_id || null]
+    );
+
+    await client.query('COMMIT');
+    res.json({ success: true, id: result.rows[0].id });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/expenses', async (req, res) => {
+  const { warehouse_id, status } = req.query;
+  try {
+    const result = status
+      ? await pool.query(
+          `SELECT e.id, e.concept, e.amount, e.remaining_amount, e.status, e.applied_at, e.created_at, u.name AS user_name
+           FROM expenses e LEFT JOIN users u ON u.id = e.user_id
+           WHERE e.warehouse_id = $1 AND e.status = $2
+           ORDER BY e.created_at DESC`,
+          [warehouse_id || 1, status]
+        )
+      : await pool.query(
+          `SELECT e.id, e.concept, e.amount, e.remaining_amount, e.status, e.applied_at, e.created_at, u.name AS user_name
+           FROM expenses e LEFT JOIN users u ON u.id = e.user_id
+           WHERE e.warehouse_id = $1
+           ORDER BY e.created_at DESC`,
+          [warehouse_id || 1]
+        );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/expenses/:id/apply', async (req, res) => {
+  const { id } = req.params;
+  try {
+    await pool.query(
+      `UPDATE expenses SET status='applied', applied_at=NOW() WHERE id=$1 AND status='pending'`,
+      [id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`💻 Server corriendo en puerto ${PORT}`));
