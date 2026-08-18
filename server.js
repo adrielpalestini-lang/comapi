@@ -1149,7 +1149,14 @@ app.post('/api/cash-cuts', async (req, res) => {
     );
     const returnsTotal = Number(returnsRes.rows[0].total);
 
-       let openingFund = 0;
+    // Ventas netas de devoluciones, por método (esto faltaba declarar)
+    const netByMethod = byMethod.rows.map(r => {
+      const isCash = r.method_name.toLowerCase().includes('efectivo');
+      const total = Number(r.total);
+      return { method_name: r.method_name, total: isCash ? Math.max(total - returnsTotal, 0) : total };
+    });
+
+    let openingFund = 0;
     if (shift_id) {
       const shiftRes = await client.query(`SELECT opening_fund FROM cash_shifts WHERE id = $1`, [shift_id]);
       openingFund = Number(shiftRes.rows[0]?.opening_fund || 0);
@@ -1180,12 +1187,13 @@ app.post('/api/cash-cuts', async (req, res) => {
     }
     const egressActuallyCovered = Number((egressTotal - egressPool).toFixed(2));
 
+    // Única declaración de estas 2 variables (antes había una segunda copia rota con "cashFinal")
     const cashSalesFinal = cashIdx >= 0 ? baseByMethod[cashIdx].total : 0;
     const expectedCashWithFund = Number((cashSalesFinal + openingFund).toFixed(2));
     const difference = Number((Number(counted_cash) - expectedCashWithFund).toFixed(2));
 
     const byMethodFull = baseByMethod.map((m, idx) => {
-      if (idx === cashIdx) return { ...m }; // sin "counted"/"difference", se maneja aparte con countedCash
+      if (idx === cashIdx) return { ...m };
       const match = (counted_methods || []).find((cm) => cm.method_name === m.method_name);
       const counted = match ? Number(match.counted) : m.total;
       return { ...m, counted, difference: Number((counted - m.total).toFixed(2)) };
@@ -1200,9 +1208,6 @@ app.post('/api/cash-cuts', async (req, res) => {
       await client.query(`UPDATE expenses SET remaining_amount = remaining_amount - $1 WHERE id = $2`, [consume, exp.id]);
       poolToConsume -= consume;
     }
-
-    const expectedCashWithFund = cashFinal;
-    const difference = Number((Number(counted_cash) - expectedCashWithFund).toFixed(2));
 
     const cutResult = await client.query(
       `INSERT INTO cash_cuts
