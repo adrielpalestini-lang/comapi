@@ -1051,16 +1051,31 @@ app.post('/api/cash-cuts', async (req, res) => {
     const egressActuallyCovered = Number((egressTotal - egressPool).toFixed(2));
 
     // Única declaración de estas 2 variables (antes había una segunda copia rota con "cashFinal")
-    const cashSalesFinal = cashIdx >= 0 ? baseByMethod[cashIdx].total : 0;
-    const expectedCashWithFund = Number((cashSalesFinal + openingFund).toFixed(2));
-    const difference = Number((Number(counted_cash) - expectedCashWithFund).toFixed(2));
-
+       // Reasignación: si lo confirmado en un método no-efectivo es distinto a lo
+    // esperado, la diferencia se traslada al efectivo (si confirman menos
+    // tarjeta de la esperada, ese faltante se asume cobrado en efectivo, y viceversa).
+    let cardReassignment = 0;
     const byMethodFull = baseByMethod.map((m, idx) => {
       if (idx === cashIdx) return { ...m };
       const match = (counted_methods || []).find((cm) => cm.method_name === m.method_name);
       const counted = match ? Number(match.counted) : m.total;
+      cardReassignment += m.total - counted;
       return { ...m, counted, difference: Number((counted - m.total).toFixed(2)) };
     });
+
+    // Ajustes manuales por ventas olvidadas de registrar
+    const manualCash = (manual_adjustments || [])
+      .filter(a => a.method === 'efectivo')
+      .reduce((a, x) => a + Number(x.amount), 0);
+    const manualCardTotal = (manual_adjustments || [])
+      .filter(a => a.method === 'tarjeta')
+      .reduce((a, x) => a + Number(x.amount), 0);
+
+    const cashSalesFinal = cashIdx >= 0 ? baseByMethod[cashIdx].total : 0;
+    const expectedCashWithFund = Number(
+      (cashSalesFinal + openingFund + cardReassignment + manualCash).toFixed(2)
+    );
+    const difference = Number((Number(counted_cash) - expectedCashWithFund).toFixed(2));
 
     // Consume el remaining_amount de cada egreso, más antiguo primero
     let poolToConsume = egressActuallyCovered;
@@ -1075,12 +1090,13 @@ app.post('/api/cash-cuts', async (req, res) => {
     const cutResult = await client.query(
       `INSERT INTO cash_cuts
        (org_id, warehouse_id, user_id, period_start, period_end, sales_total,
-        payments_breakdown, counted_cash, expected_cash, difference, denomination_breakdown, shift_id)
-       VALUES (NULL,$1,$2,$3,NOW(),$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+        payments_breakdown, counted_cash, expected_cash, difference, denomination_breakdown, shift_id, manual_adjustments)
+       VALUES (NULL,$1,$2,$3,NOW(),$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
       [warehouse_id || 1, user_id || null, since,
-       Number(salesRes.rows[0].sales_total),
+       Number(salesRes.rows[0].sales_total) + manualCash + manualCardTotal,
        JSON.stringify(byMethodFull), counted_cash, expectedCashWithFund, difference,
-       JSON.stringify(denomination_breakdown || []), shift_id || null]
+       JSON.stringify(denomination_breakdown || []), shift_id || null,
+       JSON.stringify(manual_adjustments || [])]
     );
     const cutId = cutResult.rows[0].id;
 
@@ -1211,7 +1227,7 @@ app.get('/api/cash-cuts/summary', async (req, res) => {
 app.post('/api/cash-cuts', async (req, res) => {
   const {
     warehouse_id, user_id, counted_cash, denomination_breakdown, counted_methods,
-    shift_id, fund_action, next_opening_fund,
+    shift_id, fund_action, next_opening_fund, manual_adjustments,
   } = req.body;
   const client = await pool.connect();
   try {
@@ -1344,6 +1360,8 @@ app.post('/api/cash-cuts', async (req, res) => {
 });
 
 
+
+
 // Historial de cortes ya realizados
 app.get('/api/cash-cuts', async (req, res) => {
   const { warehouse_id, page = 1, limit = 15 } = req.query;
@@ -1375,6 +1393,55 @@ app.get('/api/cash-cuts', async (req, res) => {
   }
 });
 
+
+
+app.get('/api/cash-cuts/summary/by-org', async (req, res) => {
+  const { warehouse_id, shift_id } = req.query;
+  try {
+    const lastCut = await pool.query(
+      `SELECT period_end FROM cash_cuts WHERE warehouse_id = $1 ORDER BY period_end DESC LIMIT 1`,
+      [warehouse_id || 1]
+    );
+    const since = lastCut.rows[0]?.period_end || '1970-01-01';
+
+    // Se basa en JOIN contra "organizations" activas — cualquier org nueva
+    // que tenga ventas en el período aparece automáticamente, sin tocar código.
+    const salesByOrg = await pool.query(
+      `SELECT o.id AS org_id, o.name AS org_name,
+              COALESCE(SUM(s.total), 0) AS sales_total, COUNT(s.id) AS sale_count
+       FROM organizations o
+       LEFT JOIN sales s ON s.org_id = o.id AND s.warehouse_id = $1 AND s.created_at > $2
+       WHERE o.is_active = TRUE
+       GROUP BY o.id, o.name
+       ORDER BY o.name`,
+      [warehouse_id || 1, since]
+    );
+
+    const methodsByOrg = await pool.query(
+      `SELECT s.org_id, pm.name AS method_name, COALESCE(SUM(sp.amount), 0) AS total
+       FROM sale_payments sp
+       JOIN sales s ON s.id = sp.sale_id
+       JOIN payment_methods pm ON pm.id = sp.payment_method_id
+       WHERE s.warehouse_id = $1 AND s.created_at > $2
+       GROUP BY s.org_id, pm.name`,
+      [warehouse_id || 1, since]
+    );
+
+    const result = salesByOrg.rows.map(org => ({
+      org_id: org.org_id,
+      org_name: org.org_name,
+      sales_total: Number(org.sales_total),
+      sale_count: Number(org.sale_count),
+      by_method: methodsByOrg.rows
+        .filter(m => m.org_id === org.org_id)
+        .map(m => ({ method_name: m.method_name, total: Number(m.total) })),
+    }));
+
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 app.put('/api/customers/full/:id', async (req, res) => {
   const { id } = req.params;
