@@ -1008,12 +1008,6 @@ app.get('/api/cash-cuts/summary', async (req, res) => {
     );
     const returnsTotal = Number(returnsRes.rows[0].total);
 
-    let openingFund = 0;
-    if (shift_id) {
-      const shiftRes = await pool.query(`SELECT opening_fund FROM cash_shifts WHERE id = $1`, [shift_id]);
-      openingFund = Number(shiftRes.rows[0]?.opening_fund || 0);
-    }
-
     // Ventas netas de devoluciones, por método
     const netByMethod = byMethod.rows.map(r => {
       const isCash = r.method_name.toLowerCase().includes('efectivo');
@@ -1021,11 +1015,13 @@ app.get('/api/cash-cuts/summary', async (req, res) => {
       return { method_name: r.method_name, total: isCash ? Math.max(total - returnsTotal, 0) : total };
     });
 
-    // Efectivo esperado = ventas en efectivo (netas) + fondo de caja
-    const cashIdx = netByMethod.findIndex(m => m.method_name.toLowerCase().includes('efectivo'));
-    const cashWithFund = (cashIdx >= 0 ? netByMethod[cashIdx].total : 0) + openingFund;
+    let openingFund = 0;
+    if (shift_id) {
+      const shiftRes = await pool.query(`SELECT opening_fund FROM cash_shifts WHERE id = $1`, [shift_id]);
+      openingFund = Number(shiftRes.rows[0]?.opening_fund || 0);
+    }
 
-    // Egresos aplicados y aún no cubiertos por completo (más antiguos primero)
+    // Egresos aplicados y aún no cubiertos (más antiguos primero)
     const expensesRes = await pool.query(
       `SELECT id, concept, amount, remaining_amount, applied_at
        FROM expenses
@@ -1035,22 +1031,28 @@ app.get('/api/cash-cuts/summary', async (req, res) => {
     );
     const egressTotal = expensesRes.rows.reduce((a, e) => a + Number(e.remaining_amount), 0);
 
-    // Descuenta primero del efectivo, luego del resto de métodos, solo lo disponible
+    // Deducir egresos: primero de efectivo, luego del resto — el fondo NO se toca aquí
+    const cashIdx = netByMethod.findIndex(m => m.method_name.toLowerCase().includes('efectivo'));
     let egressPool = egressTotal;
-    const deductFromCash = Math.min(cashWithFund, egressPool);
-    const cashFinal = cashWithFund - deductFromCash;
-    egressPool -= deductFromCash;
+    let finalByMethod = netByMethod.map(m => ({ ...m }));
 
-    const finalByMethod = netByMethod.map((m, idx) => {
-      if (idx === cashIdx) return { ...m, total: cashFinal };
-      if (egressPool <= 0) return m;
-      const deduct = Math.min(m.total, egressPool);
+    if (cashIdx >= 0 && egressPool > 0) {
+      const deduct = Math.min(finalByMethod[cashIdx].total, egressPool);
+      finalByMethod[cashIdx].total = Number((finalByMethod[cashIdx].total - deduct).toFixed(2));
       egressPool -= deduct;
-      return { ...m, total: m.total - deduct };
-    });
+    }
+    for (let idx = 0; idx < finalByMethod.length; idx++) {
+      if (idx === cashIdx || egressPool <= 0) continue;
+      const deduct = Math.min(finalByMethod[idx].total, egressPool);
+      finalByMethod[idx].total = Number((finalByMethod[idx].total - deduct).toFixed(2));
+      egressPool -= deduct;
+    }
+    const egressCovered = Number((egressTotal - egressPool).toFixed(2));
+    const egressUncovered = Number(egressPool.toFixed(2));
 
-    const egressCovered = egressTotal - egressPool;
-    const egressUncovered = egressPool;
+    // El fondo se suma UNA sola vez, solo para el total final esperado
+    const cashSalesFinal = cashIdx >= 0 ? finalByMethod[cashIdx].total : 0;
+    const cashExpectedTotal = Number((cashSalesFinal + openingFund).toFixed(2));
 
     res.json({
       period_start: since,
@@ -1065,6 +1067,7 @@ app.get('/api/cash-cuts/summary', async (req, res) => {
       egress_total: egressTotal,
       egress_covered: egressCovered,
       egress_uncovered: egressUncovered,
+      cash_expected_total: cashExpectedTotal,
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1108,21 +1111,12 @@ app.post('/api/cash-cuts', async (req, res) => {
     );
     const returnsTotal = Number(returnsRes.rows[0].total);
 
-    let openingFund = 0;
+       let openingFund = 0;
     if (shift_id) {
       const shiftRes = await client.query(`SELECT opening_fund FROM cash_shifts WHERE id = $1`, [shift_id]);
       openingFund = Number(shiftRes.rows[0]?.opening_fund || 0);
     }
 
-    const netByMethod = byMethod.rows.map(r => {
-      const isCash = r.method_name.toLowerCase().includes('efectivo');
-      const total = Number(r.total);
-      return { method_name: r.method_name, total: isCash ? Math.max(total - returnsTotal, 0) : total };
-    });
-    const cashIdx = netByMethod.findIndex(m => m.method_name.toLowerCase().includes('efectivo'));
-    const cashWithFund = (cashIdx >= 0 ? netByMethod[cashIdx].total : 0) + openingFund;
-
-    // Egresos aplicados pendientes de cubrir, más antiguos primero
     const expensesRes = await client.query(
       `SELECT id, remaining_amount FROM expenses
        WHERE warehouse_id = $1 AND status = 'applied' AND remaining_amount > 0
@@ -1131,33 +1125,35 @@ app.post('/api/cash-cuts', async (req, res) => {
     );
     const egressTotal = expensesRes.rows.reduce((a, e) => a + Number(e.remaining_amount), 0);
 
+    const cashIdx = netByMethod.findIndex(m => m.method_name.toLowerCase().includes('efectivo'));
     let egressPool = egressTotal;
-    const deductFromCash = Math.min(cashWithFund, egressPool);
-    const cashFinal = cashWithFund - deductFromCash;
-    egressPool -= deductFromCash;
+    let baseByMethod = netByMethod.map(m => ({ ...m }));
 
-    const byMethodFull = netByMethod.map((m, idx) => {
-      let finalTotal = m.total;
-      if (idx === cashIdx) {
-        finalTotal = cashFinal;
-      } else if (egressPool > 0) {
-        const deduct = Math.min(m.total, egressPool);
-        egressPool -= deduct;
-        finalTotal = m.total - deduct;
-      }
+    if (cashIdx >= 0 && egressPool > 0) {
+      const deduct = Math.min(baseByMethod[cashIdx].total, egressPool);
+      baseByMethod[cashIdx].total = Number((baseByMethod[cashIdx].total - deduct).toFixed(2));
+      egressPool -= deduct;
+    }
+    for (let idx = 0; idx < baseByMethod.length; idx++) {
+      if (idx === cashIdx || egressPool <= 0) continue;
+      const deduct = Math.min(baseByMethod[idx].total, egressPool);
+      baseByMethod[idx].total = Number((baseByMethod[idx].total - deduct).toFixed(2));
+      egressPool -= deduct;
+    }
+    const egressActuallyCovered = Number((egressTotal - egressPool).toFixed(2));
+
+    const cashSalesFinal = cashIdx >= 0 ? baseByMethod[cashIdx].total : 0;
+    const expectedCashWithFund = Number((cashSalesFinal + openingFund).toFixed(2));
+    const difference = Number((Number(counted_cash) - expectedCashWithFund).toFixed(2));
+
+    const byMethodFull = baseByMethod.map((m, idx) => {
+      if (idx === cashIdx) return { ...m }; // sin "counted"/"difference", se maneja aparte con countedCash
       const match = (counted_methods || []).find((cm) => cm.method_name === m.method_name);
-      const counted = idx === cashIdx ? undefined : (match ? Number(match.counted) : finalTotal);
-      return {
-        method_name: m.method_name,
-        total: finalTotal,
-        counted: idx === cashIdx ? undefined : counted,
-        difference: idx === cashIdx ? undefined : Number(((counted ?? finalTotal) - finalTotal).toFixed(2)),
-      };
+      const counted = match ? Number(match.counted) : m.total;
+      return { ...m, counted, difference: Number((counted - m.total).toFixed(2)) };
     });
 
-    const egressActuallyCovered = egressTotal - egressPool;
-
-    // Consume el remaining_amount de cada egreso, más antiguo primero, con lo que sí se cubrió
+    // Consume el remaining_amount de cada egreso, más antiguo primero
     let poolToConsume = egressActuallyCovered;
     for (const exp of expensesRes.rows) {
       if (poolToConsume <= 0) break;
