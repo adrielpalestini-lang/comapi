@@ -978,7 +978,7 @@ app.put('/api/organizations/:id/loyalty-settings', async (req, res) => {
 app.post('/api/cash-cuts', async (req, res) => {
   const {
     warehouse_id, user_id, counted_cash, denomination_breakdown, counted_methods,
-    shift_id, fund_action, next_opening_fund,
+    shift_id, fund_action, next_opening_fund, manual_adjustments,
   } = req.body;
   const client = await pool.connect();
   try {
@@ -1054,7 +1054,7 @@ app.post('/api/cash-cuts', async (req, res) => {
        // Reasignación: si lo confirmado en un método no-efectivo es distinto a lo
     // esperado, la diferencia se traslada al efectivo (si confirman menos
     // tarjeta de la esperada, ese faltante se asume cobrado en efectivo, y viceversa).
-    let cardReassignment = 0;
+  let cardReassignment = 0;
     const byMethodFull = baseByMethod.map((m, idx) => {
       if (idx === cashIdx) return { ...m };
       const match = (counted_methods || []).find((cm) => cm.method_name === m.method_name);
