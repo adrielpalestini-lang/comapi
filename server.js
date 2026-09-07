@@ -2880,6 +2880,84 @@ app.post('/api/expenses/:id/apply', async (req, res) => {
 });
 
 
+// GET /api/billing/verify?folio=123&fecha=2026-09-01
+// Verifica folio+fecha y si ya existe solicitud de facturación
+app.get('/api/billing/verify', async (req, res) => {
+  const { folio, fecha } = req.query;
+  try {
+    const saleRes = await pool.query(
+      `SELECT s.id, s.total, s.is_cancelled, o.name AS org_name
+       FROM sales s JOIN organizations o ON o.id = s.org_id
+       WHERE s.id = $1 AND DATE(s.created_at) = $2`,
+      [folio, fecha]
+    );
+    if (saleRes.rows.length === 0) {
+      return res.status(404).json({ error: 'El folio y la fecha no corresponden a ninguna venta' });
+    }
+    const sale = saleRes.rows[0];
+    if (sale.is_cancelled) {
+      return res.status(400).json({ error: 'Esta venta fue cancelada y no puede facturarse' });
+    }
+
+    const billingRes = await pool.query(
+      `SELECT status FROM billing_data WHERE sale_id = $1`,
+      [folio]
+    );
+    if (billingRes.rows.length > 0) {
+      const status = billingRes.rows[0].status;
+      const msg = status === 'facturado'
+        ? 'Este folio ya fue facturado'
+        : 'Este folio ya está en proceso de facturación';
+      return res.status(409).json({ error: msg, status });
+    }
+
+    res.json({ sale_id: sale.id, total: sale.total, org_name: sale.org_name });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/billing — crea la solicitud de facturación
+app.post('/api/billing', async (req, res) => {
+  const {
+    sale_id, nombre, apellido_paterno, apellido_materno, persona_tipo,
+    rfc, business_name, calle, numero_ext, numero_int, colonia,
+    ciudad, estado, zip_code, uso_cfdi, customer_email, telefono,
+  } = req.body;
+  try {
+    const result = await pool.query(
+      `INSERT INTO billing_data
+       (sale_id, nombre, apellido_paterno, apellido_materno, persona_tipo,
+        customer_rfc, customer_name, calle, numero_ext, numero_int, colonia,
+        ciudad, estado, zip_code, uso_cfdi, customer_email, telefono, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'pendiente')
+       RETURNING id`,
+      [sale_id, nombre || null, apellido_paterno || null, apellido_materno || null, persona_tipo,
+       rfc, business_name || `${nombre} ${apellido_paterno} ${apellido_materno || ''}`.trim(),
+       calle, numero_ext, numero_int || null, colonia, ciudad, estado, zip_code, uso_cfdi,
+       customer_email, telefono]
+    );
+    res.json({ success: true, id: result.rows[0].id });
+  } catch (error) {
+    if (error.code === '23505') { // unique_violation por sale_id
+      return res.status(409).json({ error: 'Este folio ya tiene una solicitud de facturación registrada' });
+    }
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/cfdi-usage — catálogo para el select
+app.get('/api/cfdi-usage', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT code, description FROM cfdi_usage_catalog WHERE is_active = TRUE ORDER BY code`
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`💻 Server corriendo en puerto ${PORT}`));
 
