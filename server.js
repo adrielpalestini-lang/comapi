@@ -3032,7 +3032,6 @@ app.get('/api/reports/cash-fund-summary', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-
 // Matriz de ventas: día de la semana x bloque de 30 min
 app.get('/api/reports/sales-matrix', async (req, res) => {
   const { warehouse_id, org_id, from, to } = req.query;
