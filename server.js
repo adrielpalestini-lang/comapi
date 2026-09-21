@@ -1819,25 +1819,57 @@ app.get('/api/reports/sales-daily', async (req, res) => {
   const { warehouse_id, from, to } = req.query;
   try {
     const result = await pool.query(
-      `SELECT DATE(s.created_at) AS day,
-              COUNT(*) AS sale_count,
-              SUM(s.total) AS total,
-              SUM(CASE WHEN s.org_id = 1 THEN s.total ELSE 0 END) AS total_tienda,
-              SUM(CASE WHEN s.org_id = 2 THEN s.total ELSE 0 END) AS total_cafe
-       FROM sales s
-       WHERE s.warehouse_id = $1
-         AND ($2::date IS NULL OR s.created_at >= $2::date)
-         AND ($3::date IS NULL OR s.created_at < $3::date + interval '1 day')
-       GROUP BY DATE(s.created_at)
+      `WITH ventas AS (
+         SELECT
+           DATE(s.created_at) AS day,
+           COUNT(*) FILTER (WHERE NOT s.is_cancelled) AS sale_count,
+           COUNT(*) FILTER (WHERE s.is_cancelled) AS cancelled_count,
+           COALESCE(SUM(s.total) FILTER (WHERE NOT s.is_cancelled), 0) AS total,
+           COALESCE(SUM(s.total) FILTER (WHERE NOT s.is_cancelled AND s.org_id = 1), 0) AS total_tienda,
+           COALESCE(SUM(s.total) FILTER (WHERE NOT s.is_cancelled AND s.org_id = 2), 0) AS total_cafe,
+           COALESCE(SUM(s.discount_amount) FILTER (WHERE NOT s.is_cancelled), 0) AS total_descuentos,
+           COALESCE(SUM(s.total) FILTER (WHERE s.is_cancelled), 0) AS total_cancelaciones
+         FROM sales s
+         WHERE s.warehouse_id = $1
+           AND ($2::date IS NULL OR s.created_at >= $2::date)
+           AND ($3::date IS NULL OR s.created_at < $3::date + interval '1 day')
+         GROUP BY DATE(s.created_at)
+       ),
+       devoluciones AS (
+         SELECT DATE(sr.created_at) AS day,
+                COALESCE(SUM(sr.amount) FILTER (WHERE sr.return_type = 'partial'), 0) AS total_devoluciones
+         FROM sale_returns sr
+         JOIN sales s ON s.id = sr.original_sale_id
+         WHERE s.warehouse_id = $1
+           AND ($2::date IS NULL OR sr.created_at >= $2::date)
+           AND ($3::date IS NULL OR sr.created_at < $3::date + interval '1 day')
+         GROUP BY DATE(sr.created_at)
+       )
+       SELECT
+         COALESCE(v.day, d.day) AS day,
+         COALESCE(v.sale_count, 0) AS sale_count,
+         COALESCE(v.cancelled_count, 0) AS cancelled_count,
+         COALESCE(v.total, 0) AS total,
+         COALESCE(v.total_tienda, 0) AS total_tienda,
+         COALESCE(v.total_cafe, 0) AS total_cafe,
+         COALESCE(v.total_descuentos, 0) AS total_descuentos,
+         COALESCE(v.total_cancelaciones, 0) AS total_cancelaciones,
+         COALESCE(d.total_devoluciones, 0) AS total_devoluciones
+       FROM ventas v
+       FULL OUTER JOIN devoluciones d ON d.day = v.day
        ORDER BY day DESC`,
       [warehouse_id || 1, from || null, to || null]
     );
     res.json(result.rows.map(r => ({
       day: r.day,
       sale_count: Number(r.sale_count),
-      total: Number(r.total),
+      cancelled_count: Number(r.cancelled_count),
+      total: Number(r.total) - Number(r.total_devoluciones),   // neto real de devoluciones parciales
       total_tienda: Number(r.total_tienda),
       total_cafe: Number(r.total_cafe),
+      total_descuentos: Number(r.total_descuentos),
+      total_cancelaciones: Number(r.total_cancelaciones),
+      total_devoluciones: Number(r.total_devoluciones),
     })));
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1879,17 +1911,18 @@ app.get('/api/reports/cafe-top-products', async (req, res) => {
   const { warehouse_id, from, to } = req.query;
   try {
     const result = await pool.query(
-      `SELECT csd.cafe_product_id, csd.name,
-              SUM(csd.quantity) AS total_qty,
-              SUM(csd.subtotal) AS total_revenue,
-              COUNT(DISTINCT csd.sale_id) AS times_sold
-       FROM cafe_sale_details csd
-       JOIN sales s ON s.id = csd.sale_id
-       WHERE s.warehouse_id = $1
-         AND ($2::date IS NULL OR s.created_at >= $2::date)
-         AND ($3::date IS NULL OR s.created_at < $3::date + interval '1 day')
-       GROUP BY csd.cafe_product_id, csd.name
-       ORDER BY total_qty DESC`,
+            `SELECT csd.cafe_product_id, csd.name,
+                SUM(csd.quantity) AS total_qty,
+                SUM(csd.subtotal) AS total_revenue,
+                COUNT(DISTINCT csd.sale_id) AS times_sold
+        FROM cafe_sale_details csd
+        JOIN sales s ON s.id = csd.sale_id
+        WHERE s.warehouse_id = $1
+          AND NOT s.is_cancelled          -- 👈 agregar
+          AND ($2::date IS NULL OR s.created_at >= $2::date)
+          AND ($3::date IS NULL OR s.created_at < $3::date + interval '1 day')
+        GROUP BY csd.cafe_product_id, csd.name
+        ORDER BY total_qty DESC`,
       [warehouse_id || 1, from || null, to || null]
     );
     res.json(result.rows.map(r => ({
@@ -2953,6 +2986,37 @@ app.get('/api/cfdi-usage', async (req, res) => {
       `SELECT code, description FROM cfdi_usage_catalog WHERE is_active = TRUE ORDER BY code`
     );
     res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+app.get('/api/reports/cash-fund-summary', async (req, res) => {
+  const { warehouse_id, from, to } = req.query;
+  try {
+    const result = await pool.query(
+      `SELECT
+         COUNT(cc.id) AS cuts_count,
+         COALESCE(SUM(cs.opening_fund), 0) AS total_fondo,
+         COALESCE(SUM(cc.counted_cash), 0) AS total_contado,
+         COALESCE(SUM(cc.expected_cash), 0) AS total_esperado,
+         COALESCE(SUM(cc.difference), 0) AS total_diferencia
+       FROM cash_cuts cc
+       LEFT JOIN cash_shifts cs ON cs.id = cc.shift_id
+       WHERE cc.warehouse_id = $1
+         AND ($2::date IS NULL OR cc.period_end >= $2::date)
+         AND ($3::date IS NULL OR cc.period_end < $3::date + interval '1 day')`,
+      [warehouse_id || 1, from || null, to || null]
+    );
+    const r = result.rows[0];
+    res.json({
+      cuts_count: Number(r.cuts_count),
+      total_fondo: Number(r.total_fondo),
+      total_contado: Number(r.total_contado),
+      total_esperado: Number(r.total_esperado),
+      total_diferencia: Number(r.total_diferencia),
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
