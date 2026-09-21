@@ -1816,7 +1816,16 @@ app.delete('/api/cafe/products/:id/modifier-groups/:groupId', async (req, res) =
  
 // Ventas del día agrupadas (para gráfica de barras / tabla)
 app.get('/api/reports/sales-daily', async (req, res) => {
-  const { warehouse_id, from, to } = req.query;
+  const { warehouse_id } = req.query;
+  let { from, to } = req.query;
+
+  // Si no mandan rango de fechas, default: solo el día de hoy
+  if (!from && !to) {
+    const hoy = new Date().toISOString().split('T')[0];
+    from = hoy;
+    to = hoy;
+  }
+
   try {
     const result = await pool.query(
       `WITH ventas AS (
@@ -1831,6 +1840,7 @@ app.get('/api/reports/sales-daily', async (req, res) => {
            COALESCE(SUM(s.total) FILTER (WHERE s.is_cancelled), 0) AS total_cancelaciones
          FROM sales s
          WHERE s.warehouse_id = $1
+           AND s.org_id = 2                                   -- 👈 quemado: solo cafetería
            AND ($2::date IS NULL OR s.created_at >= $2::date)
            AND ($3::date IS NULL OR s.created_at < $3::date + interval '1 day')
          GROUP BY DATE(s.created_at)
@@ -1841,6 +1851,7 @@ app.get('/api/reports/sales-daily', async (req, res) => {
          FROM sale_returns sr
          JOIN sales s ON s.id = sr.original_sale_id
          WHERE s.warehouse_id = $1
+           AND s.org_id = 2                                   -- 👈 mismo filtro aquí
            AND ($2::date IS NULL OR sr.created_at >= $2::date)
            AND ($3::date IS NULL OR sr.created_at < $3::date + interval '1 day')
          GROUP BY DATE(sr.created_at)
@@ -1864,7 +1875,7 @@ app.get('/api/reports/sales-daily', async (req, res) => {
       day: r.day,
       sale_count: Number(r.sale_count),
       cancelled_count: Number(r.cancelled_count),
-      total: Number(r.total) - Number(r.total_devoluciones),   // neto real de devoluciones parciales
+      total: Number(r.total) - Number(r.total_devoluciones),
       total_tienda: Number(r.total_tienda),
       total_cafe: Number(r.total_cafe),
       total_descuentos: Number(r.total_descuentos),
