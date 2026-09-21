@@ -3022,6 +3022,38 @@ app.get('/api/reports/cash-fund-summary', async (req, res) => {
   }
 });
 
+// Matriz de ventas: día de la semana x bloque de 30 min
+app.get('/api/reports/sales-matrix', async (req, res) => {
+  const { warehouse_id, org_id, from, to } = req.query;
+  try {
+    const result = await pool.query(
+      `SELECT
+         EXTRACT(ISODOW FROM s.created_at)::int AS dow,               -- 1=Lunes ... 7=Domingo
+         (EXTRACT(HOUR FROM s.created_at)::int * 60
+           + (FLOOR(EXTRACT(MINUTE FROM s.created_at) / 30) * 30))::int AS slot_minutes,
+         COALESCE(SUM(s.total), 0) AS total,
+         COUNT(*) AS sale_count
+       FROM sales s
+       WHERE s.warehouse_id = $1
+         AND NOT s.is_cancelled
+         AND ($2::int IS NULL OR s.org_id = $2)
+         AND ($3::date IS NULL OR s.created_at >= $3::date)
+         AND ($4::date IS NULL OR s.created_at < $4::date + interval '1 day')
+       GROUP BY dow, slot_minutes
+       ORDER BY dow, slot_minutes`,
+      [warehouse_id || 1, org_id || null, from || null, to || null]
+    );
+    res.json(result.rows.map(r => ({
+      dow: Number(r.dow),
+      slot_minutes: Number(r.slot_minutes),
+      total: Number(r.total),
+      sale_count: Number(r.sale_count),
+    })));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`💻 Server corriendo en puerto ${PORT}`));
 
