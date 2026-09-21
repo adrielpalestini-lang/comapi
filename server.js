@@ -1820,43 +1820,42 @@ app.delete('/api/cafe/products/:id/modifier-groups/:groupId', async (req, res) =
 app.get('/api/reports/sales-daily', async (req, res) => {
   const { warehouse_id } = req.query;
   let { from, to } = req.query;
-
-  // Si no mandan rango de fechas, default: solo el día de hoy
   if (!from && !to) {
     const hoy = new Date().toISOString().split('T')[0];
-    from = hoy;
-    to = hoy;
+    from = hoy; to = hoy;
   }
-
   try {
     const result = await pool.query(
-      `WITH ventas AS (
-         SELECT
-           DATE(s.created_at) AS day,
-           COUNT(*) FILTER (WHERE NOT s.is_cancelled) AS sale_count,
-           COUNT(*) FILTER (WHERE s.is_cancelled) AS cancelled_count,
-           COALESCE(SUM(s.total) FILTER (WHERE NOT s.is_cancelled), 0) AS total,
-           COALESCE(SUM(s.total) FILTER (WHERE NOT s.is_cancelled AND s.org_id = 1), 0) AS total_tienda,
-           COALESCE(SUM(s.total) FILTER (WHERE NOT s.is_cancelled AND s.org_id = 2), 0) AS total_cafe,
-           COALESCE(SUM(s.discount_amount) FILTER (WHERE NOT s.is_cancelled), 0) AS total_descuentos,
-           COALESCE(SUM(s.total) FILTER (WHERE s.is_cancelled), 0) AS total_cancelaciones
+      `WITH base AS (
+         SELECT s.*, s.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Mexico_City' AS local_time
          FROM sales s
          WHERE s.warehouse_id = $1
-           AND s.org_id = 2                                   -- 👈 quemado: solo cafetería
-           AND ($2::date IS NULL OR s.created_at >= $2::date)
-           AND ($3::date IS NULL OR s.created_at < $3::date + interval '1 day')
-         GROUP BY DATE(s.created_at)
+           AND s.org_id = 2
+       ),
+       ventas AS (
+         SELECT
+           DATE(local_time) AS day,
+           COUNT(*) FILTER (WHERE NOT is_cancelled) AS sale_count,
+           COUNT(*) FILTER (WHERE is_cancelled) AS cancelled_count,
+           COALESCE(SUM(total) FILTER (WHERE NOT is_cancelled), 0) AS total,
+           COALESCE(SUM(total) FILTER (WHERE NOT is_cancelled AND org_id = 1), 0) AS total_tienda,
+           COALESCE(SUM(total) FILTER (WHERE NOT is_cancelled AND org_id = 2), 0) AS total_cafe,
+           COALESCE(SUM(discount_amount) FILTER (WHERE NOT is_cancelled), 0) AS total_descuentos,
+           COALESCE(SUM(total) FILTER (WHERE is_cancelled), 0) AS total_cancelaciones
+         FROM base
+         WHERE ($2::date IS NULL OR local_time >= $2::date)
+           AND ($3::date IS NULL OR local_time < $3::date + interval '1 day')
+         GROUP BY DATE(local_time)
        ),
        devoluciones AS (
-         SELECT DATE(sr.created_at) AS day,
+         SELECT DATE(sr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Mexico_City') AS day,
                 COALESCE(SUM(sr.amount) FILTER (WHERE sr.return_type = 'partial'), 0) AS total_devoluciones
          FROM sale_returns sr
          JOIN sales s ON s.id = sr.original_sale_id
-         WHERE s.warehouse_id = $1
-           AND s.org_id = 2                                   -- 👈 mismo filtro aquí
-           AND ($2::date IS NULL OR sr.created_at >= $2::date)
-           AND ($3::date IS NULL OR sr.created_at < $3::date + interval '1 day')
-         GROUP BY DATE(sr.created_at)
+         WHERE s.warehouse_id = $1 AND s.org_id = 2
+           AND ($2::date IS NULL OR (sr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Mexico_City') >= $2::date)
+           AND ($3::date IS NULL OR (sr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Mexico_City') < $3::date + interval '1 day')
+         GROUP BY day
        )
        SELECT
          COALESCE(v.day, d.day) AS day,
@@ -3018,8 +3017,8 @@ app.get('/api/reports/cash-fund-summary', async (req, res) => {
        FROM cash_cuts cc
        LEFT JOIN cash_shifts cs ON cs.id = cc.shift_id
        WHERE cc.warehouse_id = $1
-         AND ($2::date IS NULL OR cc.period_end >= $2::date)
-         AND ($3::date IS NULL OR cc.period_end < $3::date + interval '1 day')`,
+         AND ($2::date IS NULL OR (cc.period_end AT TIME ZONE 'UTC' AT TIME ZONE 'America/Mexico_City') >= $2::date)
+         AND ($3::date IS NULL OR (cc.period_end AT TIME ZONE 'UTC' AT TIME ZONE 'America/Mexico_City') < $3::date + interval '1 day')`,
       [warehouse_id || 1, from || null, to || null]
     );
     const r = result.rows[0];
@@ -3040,17 +3039,18 @@ app.get('/api/reports/sales-matrix', async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT
-         EXTRACT(ISODOW FROM s.created_at)::int AS dow,               -- 1=Lunes ... 7=Domingo
-         (EXTRACT(HOUR FROM s.created_at)::int * 60
-           + (FLOOR(EXTRACT(MINUTE FROM s.created_at) / 30) * 30))::int AS slot_minutes,
+         EXTRACT(ISODOW FROM local_time)::int AS dow,
+         (EXTRACT(HOUR FROM local_time)::int * 60
+           + (FLOOR(EXTRACT(MINUTE FROM local_time) / 30) * 30))::int AS slot_minutes,
          COALESCE(SUM(s.total), 0) AS total,
          COUNT(*) AS sale_count
-       FROM sales s
+       FROM sales s,
+       LATERAL (SELECT s.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Mexico_City' AS local_time) t
        WHERE s.warehouse_id = $1
          AND NOT s.is_cancelled
          AND ($2::int IS NULL OR s.org_id = $2)
-         AND ($3::date IS NULL OR s.created_at >= $3::date)
-         AND ($4::date IS NULL OR s.created_at < $4::date + interval '1 day')
+         AND ($3::date IS NULL OR local_time >= $3::date)
+         AND ($4::date IS NULL OR local_time < $4::date + interval '1 day')
        GROUP BY dow, slot_minutes
        ORDER BY dow, slot_minutes`,
       [warehouse_id || 1, org_id || null, from || null, to || null]
