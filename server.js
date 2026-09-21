@@ -1374,9 +1374,11 @@ app.get('/api/cash-cuts', async (req, res) => {
     const result = await pool.query(
       `SELECT cc.id, cc.period_start, cc.period_end, cc.sales_total,
               cc.counted_cash, cc.expected_cash, cc.difference,
-              cc.payments_breakdown, u.name AS user_name
+              cc.payments_breakdown, u.name AS user_name,
+              cs.opening_fund
        FROM cash_cuts cc
        LEFT JOIN users u ON u.id = cc.user_id
+       LEFT JOIN cash_shifts cs ON cs.id = cc.shift_id
        WHERE cc.warehouse_id = $1
        ORDER BY cc.period_end DESC
        LIMIT $2 OFFSET $3`,
