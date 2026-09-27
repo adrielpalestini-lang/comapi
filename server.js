@@ -2972,6 +2972,107 @@ app.get('/api/billing/verify', async (req, res) => {
   }
 });
 
+app.get('/api/users/list', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, role FROM users WHERE is_active = TRUE ORDER BY name`
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+app.get('/api/reports/cart-removals', async (req, res) => {
+  const { warehouse_id, user_id, product_type, page = 1, limit = 20 } = req.query;
+  let { from, to } = req.query;
+  if (!from && !to) {
+    const monthAgo = new Date();
+    monthAgo.setDate(monthAgo.getDate() - 30);
+    from = monthAgo.toISOString().split('T')[0];
+    to = new Date().toISOString().split('T')[0];
+  }
+  const offset = (Number(page) - 1) * Number(limit);
+  try {
+    const params = [warehouse_id || 1, from || null, to || null, user_id || null, product_type || null];
+
+    const totalRes = await pool.query(
+      `SELECT COUNT(*) FROM cart_item_removals cr
+       WHERE cr.warehouse_id = $1
+         AND ($2::date IS NULL OR (cr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Mexico_City') >= $2::date)
+         AND ($3::date IS NULL OR (cr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Mexico_City') < $3::date + interval '1 day')
+         AND ($4::int IS NULL OR cr.user_id = $4)
+         AND ($5::varchar IS NULL OR cr.product_type = $5)`,
+      params
+    );
+
+    const result = await pool.query(
+      `SELECT cr.id, cr.sale_id, cr.org_id, o.name AS org_name,
+              cr.product_type, cr.product_name, cr.quantity_removed, cr.reason,
+              cr.user_id, u.name AS user_name,
+              (cr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Mexico_City') AS created_at
+       FROM cart_item_removals cr
+       LEFT JOIN organizations o ON o.id = cr.org_id
+       LEFT JOIN users u ON u.id = cr.user_id
+       WHERE cr.warehouse_id = $1
+         AND ($2::date IS NULL OR (cr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Mexico_City') >= $2::date)
+         AND ($3::date IS NULL OR (cr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Mexico_City') < $3::date + interval '1 day')
+         AND ($4::int IS NULL OR cr.user_id = $4)
+         AND ($5::varchar IS NULL OR cr.product_type = $5)
+       ORDER BY cr.created_at DESC
+       LIMIT $6 OFFSET $7`,
+      [...params, limit, offset]
+    );
+
+    res.json({
+      removals: result.rows,
+      total: Number(totalRes.rows[0].count),
+      page: Number(page),
+      totalPages: Math.ceil(Number(totalRes.rows[0].count) / Number(limit)),
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+app.get('/api/reports/cart-removals/by-cashier', async (req, res) => {
+  const { warehouse_id } = req.query;
+  let { from, to } = req.query;
+  if (!from && !to) {
+    const monthAgo = new Date();
+    monthAgo.setDate(monthAgo.getDate() - 30);
+    from = monthAgo.toISOString().split('T')[0];
+    to = new Date().toISOString().split('T')[0];
+  }
+  try {
+    const result = await pool.query(
+      `SELECT cr.user_id, u.name AS user_name,
+              COUNT(*) AS removals_count,
+              COALESCE(SUM(cr.quantity_removed), 0) AS total_qty_removed,
+              COUNT(DISTINCT cr.sale_id) AS sales_affected
+       FROM cart_item_removals cr
+       LEFT JOIN users u ON u.id = cr.user_id
+       WHERE cr.warehouse_id = $1
+         AND ($2::date IS NULL OR (cr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Mexico_City') >= $2::date)
+         AND ($3::date IS NULL OR (cr.created_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Mexico_City') < $3::date + interval '1 day')
+       GROUP BY cr.user_id, u.name
+       ORDER BY removals_count DESC`,
+      [warehouse_id || 1, from || null, to || null]
+    );
+    res.json(result.rows.map(r => ({
+      user_id: r.user_id,
+      user_name: r.user_name || 'Sin usuario',
+      removals_count: Number(r.removals_count),
+      total_qty_removed: Number(r.total_qty_removed),
+      sales_affected: Number(r.sales_affected),
+    })));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // POST /api/billing — crea la solicitud de facturación
 app.post('/api/billing', async (req, res) => {
   const {
