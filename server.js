@@ -310,7 +310,7 @@ app.put('/api/customers/:id', async (req, res) => {
 
 // ================= VENTAS =================
 app.post('/api/sales', async (req, res) => {
-  const { org_id, warehouse_id, items, payments, user_id, customer_id, discount_amount, discount_notes } = req.body;
+  const { org_id, warehouse_id, items, payments, user_id, customer_id, discount_amount, discount_notes, random_code} = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -320,11 +320,11 @@ app.post('/api/sales', async (req, res) => {
     );
     const totalConIva = Math.max(subtotalVenta * 1.16 - (Number(discount_amount) || 0), 0);
 
-    const saleRes = await client.query(
-      `INSERT INTO sales (org_id, warehouse_id, total, discount_amount, discount_notes, created_at)
-      VALUES ($1,$2,$3,$4,$5,NOW()) RETURNING id`,
-      [org_id || 1, warehouse_id || 1, totalConIva, discount_amount || 0, discount_notes || null]
-    );
+  const saleRes = await client.query(
+  `INSERT INTO sales (org_id, warehouse_id, total, discount_amount, discount_notes, random_code, created_at)
+   VALUES ($1,$2,$3,$4,$5,$6,NOW()) RETURNING id`,
+  [org_id || 1, warehouse_id || 1, totalConIva, discount_amount || 0, discount_notes || null, random_code || null]
+);
     const saleId = saleRes.rows[0].id;
 
     for (const item of items) {
@@ -2928,17 +2928,27 @@ app.post('/api/expenses/:id/apply', async (req, res) => {
 // GET /api/billing/verify?folio=123&fecha=2026-09-01
 // Verifica folio+fecha y si ya existe solicitud de facturación
 app.get('/api/billing/verify', async (req, res) => {
-  const { folio, fecha } = req.query;
+  const { folio, fecha, hora, codigo } = req.query;
+
+  if (!folio || !fecha || !hora || !codigo) {
+    return res.status(400).json({ error: 'Folio, fecha, hora y código son obligatorios' });
+  }
+
   try {
     const saleRes = await pool.query(
       `SELECT s.id, s.total, s.is_cancelled, o.name AS org_name
        FROM sales s JOIN organizations o ON o.id = s.org_id
-       WHERE s.id = $1 AND DATE(s.created_at) = $2`,
-      [folio, fecha]
+       WHERE s.id = $1
+         AND DATE(s.created_at) = $2
+         AND date_trunc('minute', s.created_at) = date_trunc('minute', ($2 || ' ' || $3)::timestamp)
+         AND s.random_code = $4`,
+      [folio, fecha, hora, codigo]
     );
+
     if (saleRes.rows.length === 0) {
-      return res.status(404).json({ error: 'El folio y la fecha no corresponden a ninguna venta' });
+      return res.status(404).json({ error: 'Los datos no corresponden a ninguna venta. Verifica tu ticket.' });
     }
+
     const sale = saleRes.rows[0];
     if (sale.is_cancelled) {
       return res.status(400).json({ error: 'Esta venta fue cancelada y no puede facturarse' });
@@ -3065,7 +3075,20 @@ app.get('/api/reports/sales-matrix', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-
+app.post('/api/cart-removals', async (req, res) => {
+  const { warehouse_id, org_id, product_type, product_id, product_name, quantity_removed, reason, user_id } = req.body;
+  try {
+    const result = await pool.query(
+      `INSERT INTO cart_item_removals
+       (warehouse_id, org_id, product_type, product_id, product_name, quantity_removed, reason, user_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+      [warehouse_id || 1, org_id || null, product_type, product_id || null, product_name, quantity_removed, reason, user_id || null]
+    );
+    res.json({ success: true, id: result.rows[0].id });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`💻 Server corriendo en puerto ${PORT}`));
 
