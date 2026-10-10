@@ -321,10 +321,12 @@ app.post('/api/sales', async (req, res) => {
     const totalConIva = Math.max(subtotalVenta * 1.16 - (Number(discount_amount) || 0), 0);
 
   const saleRes = await client.query(
-  `INSERT INTO sales (org_id, warehouse_id, total, discount_amount, discount_notes, random_code, created_at)
-   VALUES ($1,$2,$3,$4,$5,$6,NOW()) RETURNING id`,
-  [org_id || 1, warehouse_id || 1, totalConIva, discount_amount || 0, discount_notes || null, random_code || null]
-);
+      `INSERT INTO sales (org_id, warehouse_id, total, discount_amount, discount_notes, random_code, user_id, customer_id, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()) RETURNING id`,
+      [org_id || 1, warehouse_id || 1, totalConIva, discount_amount || 0, discount_notes || null,
+       random_code || null, user_id || null, customer_id || null]
+    );
+    
     const saleId = saleRes.rows[0].id;
 
     for (const item of items) {
@@ -671,7 +673,7 @@ app.get('/api/search/all', async (req, res) => {
 
 // Registrar venta de cafetería (descuenta ingredientes del inventario)
 app.post('/api/cafe/sales', async (req, res) => {
-  const { org_id, warehouse_id, items, payments, user_id, customer_id, discount_amount, discount_notes } = req.body;
+const { org_id, warehouse_id, items, payments, user_id, customer_id, discount_amount, discount_notes, random_code } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -679,11 +681,12 @@ app.post('/api/cafe/sales', async (req, res) => {
     const subtotal = items.reduce((acc, item) => acc + (item.final_price * item.quantity), 0);
     const total = Math.max(subtotal - (Number(discount_amount) || 0), 0);
 
-    const saleRes = await client.query(
-      `INSERT INTO sales (org_id, warehouse_id, total, discount_amount, discount_notes, created_at)
-       VALUES ($1,$2,$3,$4,$5,NOW()) RETURNING id`,
-      [org_id || 2, warehouse_id || 1, total, discount_amount || 0, discount_notes || null]
-    );
+const saleRes = await client.query(
+  `INSERT INTO sales (org_id, warehouse_id, total, discount_amount, discount_notes, random_code, user_id, customer_id, created_at)
+   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()) RETURNING id`,
+  [org_id || 2, warehouse_id || 1, total, discount_amount || 0, discount_notes || null,
+   random_code || null, user_id || null, customer_id || null]
+);
     const saleId = saleRes.rows[0].id;
 
     for (const item of items) {
