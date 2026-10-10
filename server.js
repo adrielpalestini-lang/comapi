@@ -326,7 +326,7 @@ app.post('/api/sales', async (req, res) => {
       [org_id || 1, warehouse_id || 1, totalConIva, discount_amount || 0, discount_notes || null,
        random_code || null, user_id || null, customer_id || null]
     );
-    
+
     const saleId = saleRes.rows[0].id;
 
     for (const item of items) {
@@ -1823,8 +1823,8 @@ app.delete('/api/cafe/products/:id/modifier-groups/:groupId', async (req, res) =
 app.get('/api/reports/sales-daily', async (req, res) => {
   const { warehouse_id } = req.query;
   let { from, to } = req.query;
-  if (!from && !to) {
-    const hoy = new Date().toISOString().split('T')[0];
+   if (!from && !to) {
+    const hoy = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' });
     from = hoy; to = hoy;
   }
   try {
@@ -1895,7 +1895,7 @@ app.get('/api/reports/sales-daily', async (req, res) => {
 app.get('/api/reports/sales-live', async (req, res) => {
   const { warehouse_id, minutes = 240 } = req.query;
   try {
-    const result = await pool.query(
+        const result = await pool.query(
       `SELECT s.id, s.org_id, o.name AS org_name, s.total, s.created_at,
               u.name AS cashier_name,
               COALESCE(
@@ -1906,14 +1906,19 @@ app.get('/api/reports/sales-live', async (req, res) => {
        JOIN organizations o ON o.id = s.org_id
        LEFT JOIN sale_payments sp ON sp.sale_id = s.id
        LEFT JOIN payment_methods pm ON pm.id = sp.payment_method_id
-       LEFT JOIN inventory_movements im ON im.reference_type = 'sale' AND im.reference_id = s.id
-       LEFT JOIN users u ON u.id = im.user_id
+       LEFT JOIN users u ON u.id = COALESCE(
+         s.user_id,
+         (SELECT im.user_id FROM inventory_movements im
+          WHERE im.reference_type = 'sale' AND im.reference_id = s.id AND im.user_id IS NOT NULL
+          LIMIT 1)
+       )
        WHERE s.warehouse_id = $1
          AND s.created_at > NOW() - ($2 || ' minutes')::interval
        GROUP BY s.id, o.name, u.name
        ORDER BY s.created_at DESC
        LIMIT 100`,
       [warehouse_id || 1, minutes]
+  
     );
     res.json(result.rows.map(r => ({ ...r, total: Number(r.total) })));
   } catch (error) {
@@ -1932,10 +1937,10 @@ app.get('/api/reports/cafe-top-products', async (req, res) => {
                 COUNT(DISTINCT csd.sale_id) AS times_sold
         FROM cafe_sale_details csd
         JOIN sales s ON s.id = csd.sale_id
-        WHERE s.warehouse_id = $1
-          AND NOT s.is_cancelled          -- 👈 agregar
-          AND ($2::date IS NULL OR s.created_at >= $2::date)
-          AND ($3::date IS NULL OR s.created_at < $3::date + interval '1 day')
+          WHERE s.warehouse_id = $1
+          AND NOT s.is_cancelled
+          AND ($2::date IS NULL OR (s.created_at AT TIME ZONE 'UTC') AT TIME ZONE 'America/Mexico_City' >= $2::date)
+          AND ($3::date IS NULL OR (s.created_at AT TIME ZONE 'UTC') AT TIME ZONE 'America/Mexico_City' < $3::date + interval '1 day')
         GROUP BY csd.cafe_product_id, csd.name
         ORDER BY total_qty DESC`,
       [warehouse_id || 1, from || null, to || null]
@@ -2533,10 +2538,12 @@ app.get('/api/sales/search', async (req, res) => {
         SELECT s.id, s.org_id, o.name AS org_name, s.total, s.discount_amount, s.created_at, c.name AS customer_name
         FROM sales s
         JOIN organizations o ON o.id = s.org_id
-        LEFT JOIN customers c ON c.id = (
-          SELECT customer_id FROM customer_wallet_movements WHERE sale_id = s.id LIMIT 1
+        LEFT JOIN customers c ON c.id = COALESCE(
+          s.customer_id,
+          (SELECT customer_id FROM customer_wallet_movements WHERE sale_id = s.id LIMIT 1)
         )
-        WHERE s.warehouse_id = $1 AND DATE(s.created_at) = $2
+        WHERE s.warehouse_id = $1
+          AND ((s.created_at AT TIME ZONE 'UTC') AT TIME ZONE 'America/Mexico_City')::date = $2::date
         ORDER BY s.created_at DESC`;
       params = [warehouse_id || 1, date];
     } else if (customer_search) {
