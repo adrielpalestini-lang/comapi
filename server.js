@@ -1161,12 +1161,30 @@ app.get('/api/cash-cuts/summary', async (req, res) => {
     );
     const returnsTotal = Number(returnsRes.rows[0].total);
 
-    // Ventas netas de devoluciones, por método
-    const netByMethod = byMethod.rows.map(r => {
-      const isCash = r.method_name.toLowerCase().includes('efectivo');
-      const total = Number(r.total);
-      return { method_name: r.method_name, total: isCash ? Math.max(total - returnsTotal, 0) : total };
-    });
+    // Ventas por método (bruto). Las devoluciones se muestran aparte
+    // y se restan del efectivo esperado.
+    const netByMethod = byMethod.rows.map(r => ({
+      method_name: r.method_name,
+      total: Number(r.total),
+    }));
+
+    // Detalle de devoluciones del período (tickets afectados)
+    const returnsList = await pool.query(
+      `SELECT sr.id, sr.original_sale_id, sr.amount, sr.reason, sr.created_at, u.name AS user_name,
+              COALESCE(
+                json_agg(json_build_object(
+                  'product_name', i.product_name, 'quantity', i.quantity,
+                  'amount', i.amount, 'restocked', i.restocked
+                )) FILTER (WHERE i.id IS NOT NULL), '[]'
+              ) AS items
+       FROM sale_returns sr
+       LEFT JOIN sale_return_items i ON i.return_id = sr.id
+       LEFT JOIN users u ON u.id = sr.user_id
+       WHERE sr.warehouse_id = $1 AND sr.created_at > $2
+       GROUP BY sr.id, u.name
+       ORDER BY sr.created_at`,
+      [warehouse_id || 1, since]
+    );
 
     let openingFund = 0;
     if (shift_id) {
@@ -1203,9 +1221,9 @@ app.get('/api/cash-cuts/summary', async (req, res) => {
     const egressCovered = Number((egressTotal - egressPool).toFixed(2));
     const egressUncovered = Number(egressPool.toFixed(2));
 
-    // El fondo se suma UNA sola vez, solo para el total final esperado
+    // El fondo se suma UNA sola vez; las devoluciones (dinero que salió) se restan
     const cashSalesFinal = cashIdx >= 0 ? finalByMethod[cashIdx].total : 0;
-    const cashExpectedTotal = Number((cashSalesFinal + openingFund).toFixed(2));
+    const cashExpectedTotal = Number((cashSalesFinal + openingFund - returnsTotal).toFixed(2));
 
     res.json({
       period_start: since,
@@ -1214,6 +1232,15 @@ app.get('/api/cash-cuts/summary', async (req, res) => {
       by_method: finalByMethod,
       opening_fund: openingFund,
       returns_total: returnsTotal,
+      returns: returnsList.rows.map(r => ({
+        id: r.id,
+        original_sale_id: r.original_sale_id,
+        amount: Number(r.amount),
+        reason: r.reason,
+        created_at: r.created_at,
+        user_name: r.user_name,
+        items: r.items,
+      })),
       expenses: expensesRes.rows.map(e => ({
         id: e.id, concept: e.concept, amount: Number(e.amount), remaining_amount: Number(e.remaining_amount),
       })),
@@ -1264,12 +1291,11 @@ app.post('/api/cash-cuts', async (req, res) => {
     );
     const returnsTotal = Number(returnsRes.rows[0].total);
 
-    // Ventas netas de devoluciones, por método (esto faltaba declarar)
-    const netByMethod = byMethod.rows.map(r => {
-      const isCash = r.method_name.toLowerCase().includes('efectivo');
-      const total = Number(r.total);
-      return { method_name: r.method_name, total: isCash ? Math.max(total - returnsTotal, 0) : total };
-    });
+    // Ventas por método (bruto). Las devoluciones se restan aparte del efectivo esperado.
+    const netByMethod = byMethod.rows.map(r => ({
+      method_name: r.method_name,
+      total: Number(r.total),
+    }));
 
     let openingFund = 0;
     if (shift_id) {
@@ -1302,17 +1328,30 @@ app.post('/api/cash-cuts', async (req, res) => {
     }
     const egressActuallyCovered = Number((egressTotal - egressPool).toFixed(2));
 
-    // Única declaración de estas 2 variables (antes había una segunda copia rota con "cashFinal")
-    const cashSalesFinal = cashIdx >= 0 ? baseByMethod[cashIdx].total : 0;
-    const expectedCashWithFund = Number((cashSalesFinal + openingFund).toFixed(2));
-    const difference = Number((Number(counted_cash) - expectedCashWithFund).toFixed(2));
-
+    // Reasignación: si lo confirmado en un método no-efectivo es distinto a lo esperado,
+    // la diferencia se traslada al efectivo (confirman menos tarjeta => se cobró en efectivo).
+    let cardReassignment = 0;
     const byMethodFull = baseByMethod.map((m, idx) => {
       if (idx === cashIdx) return { ...m };
       const match = (counted_methods || []).find((cm) => cm.method_name === m.method_name);
       const counted = match ? Number(match.counted) : m.total;
+      cardReassignment += m.total - counted;
       return { ...m, counted, difference: Number((counted - m.total).toFixed(2)) };
     });
+
+    // Ajustes manuales por ventas olvidadas de registrar
+    const manualCash = (manual_adjustments || [])
+      .filter(a => a.method === 'efectivo')
+      .reduce((a, x) => a + Number(x.amount), 0);
+    const manualCardTotal = (manual_adjustments || [])
+      .filter(a => a.method === 'tarjeta')
+      .reduce((a, x) => a + Number(x.amount), 0);
+
+    const cashSalesFinal = cashIdx >= 0 ? baseByMethod[cashIdx].total : 0;
+    const expectedCashWithFund = Number(
+      (cashSalesFinal + openingFund - returnsTotal + cardReassignment + manualCash).toFixed(2)
+    );
+    const difference = Number((Number(counted_cash) - expectedCashWithFund).toFixed(2));
 
     // Consume el remaining_amount de cada egreso, más antiguo primero
     let poolToConsume = egressActuallyCovered;
@@ -1327,12 +1366,13 @@ app.post('/api/cash-cuts', async (req, res) => {
     const cutResult = await client.query(
       `INSERT INTO cash_cuts
        (org_id, warehouse_id, user_id, period_start, period_end, sales_total,
-        payments_breakdown, counted_cash, expected_cash, difference, denomination_breakdown, shift_id)
-       VALUES (NULL,$1,$2,$3,NOW(),$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+        payments_breakdown, counted_cash, expected_cash, difference, denomination_breakdown, shift_id, manual_adjustments)
+       VALUES (NULL,$1,$2,$3,NOW(),$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
       [warehouse_id || 1, user_id || null, since,
-       Number(salesRes.rows[0].sales_total),
+       Number(salesRes.rows[0].sales_total) + manualCash + manualCardTotal,
        JSON.stringify(byMethodFull), counted_cash, expectedCashWithFund, difference,
-       JSON.stringify(denomination_breakdown || []), shift_id || null]
+       JSON.stringify(denomination_breakdown || []), shift_id || null,
+       JSON.stringify(manual_adjustments || [])]
     );
     const cutId = cutResult.rows[0].id;
 
@@ -1377,8 +1417,13 @@ app.get('/api/cash-cuts', async (req, res) => {
     const result = await pool.query(
       `SELECT cc.id, cc.period_start, cc.period_end, cc.sales_total,
               cc.counted_cash, cc.expected_cash, cc.difference,
-              cc.payments_breakdown, u.name AS user_name,
-              cs.opening_fund
+              cc.payments_breakdown, cc.manual_adjustments,
+              u.name AS user_name,
+              cs.opening_fund,
+              (SELECT COALESCE(SUM(r.amount), 0) FROM sale_returns r
+                WHERE r.warehouse_id = cc.warehouse_id
+                  AND r.created_at > cc.period_start
+                  AND r.created_at <= cc.period_end) AS returns_total
        FROM cash_cuts cc
        LEFT JOIN users u ON u.id = cc.user_id
        LEFT JOIN cash_shifts cs ON cs.id = cc.shift_id
@@ -1397,7 +1442,6 @@ app.get('/api/cash-cuts', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-
 
 
 app.get('/api/cash-cuts/summary/by-org', async (req, res) => {
@@ -1495,7 +1539,18 @@ app.put('/api/customers/full/:id', async (req, res) => {
 app.get('/api/cash-cuts/:id/sales', async (req, res) => {
   const { id } = req.params;
   try {
-    const cut = await pool.query(`SELECT * FROM cash_cuts WHERE id = $1`, [id]);
+    const cut = await pool.query(
+      `SELECT cc.*, u.name AS user_name, cs.opening_fund,
+              (SELECT COALESCE(SUM(r.amount), 0) FROM sale_returns r
+                WHERE r.warehouse_id = cc.warehouse_id
+                  AND r.created_at > cc.period_start
+                  AND r.created_at <= cc.period_end) AS returns_total
+       FROM cash_cuts cc
+       LEFT JOIN users u ON u.id = cc.user_id
+       LEFT JOIN cash_shifts cs ON cs.id = cc.shift_id
+       WHERE cc.id = $1`,
+      [id]
+    );
     if (cut.rows.length === 0) return res.status(404).json({ error: 'Corte no encontrado' });
 
     const { warehouse_id, period_start, period_end } = cut.rows[0];
@@ -1521,7 +1576,6 @@ app.get('/api/cash-cuts/:id/sales', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-
 // Ventas del período ACTUAL (aún no se ha cerrado el corte) — para imprimir un preview
 app.get('/api/cash-cuts/current-sales', async (req, res) => {
   const { warehouse_id } = req.query;
@@ -2678,15 +2732,15 @@ app.get('/api/sales/:id/detail', async (req, res) => {
     const sale = saleRes.rows[0];
 
     const normalItems = await pool.query(
-      `SELECT sd.quantity, sd.unit_price, sd.subtotal, p.name
+      `SELECT sd.id AS sale_detail_id, sd.quantity, sd.returned_quantity, sd.unit_price, sd.subtotal, p.name
        FROM sale_details sd JOIN products p ON p.id = sd.product_id
-       WHERE sd.sale_id = $1`,
+       WHERE sd.sale_id = $1 ORDER BY sd.id`,
       [id]
     );
 
     const cafeItems = await pool.query(
-      `SELECT quantity, unit_price, subtotal, name, selected_options, notes
-       FROM cafe_sale_details WHERE sale_id = $1`,
+      `SELECT id AS cafe_sale_detail_id, quantity, returned_quantity, unit_price, subtotal, name, selected_options, notes
+       FROM cafe_sale_details WHERE sale_id = $1 ORDER BY id`,
       [id]
     );
 
