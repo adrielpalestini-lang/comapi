@@ -1141,7 +1141,7 @@ app.get('/api/cash-cuts/summary', async (req, res) => {
 
     const salesRes = await pool.query(
       `SELECT COALESCE(SUM(s.total), 0) AS sales_total, COUNT(*) AS sale_count
-       FROM sales s WHERE s.warehouse_id = $1 AND s.created_at > $2`,
+       FROM sales s WHERE s.warehouse_id = $1 AND s.created_at > $2 AND NOT s.is_cancelled`,
       [warehouse_id || 1, since]
     );
 
@@ -1150,15 +1150,20 @@ app.get('/api/cash-cuts/summary', async (req, res) => {
        FROM sale_payments sp
        JOIN sales s ON s.id = sp.sale_id
        JOIN payment_methods pm ON pm.id = sp.payment_method_id
-       WHERE s.warehouse_id = $1 AND s.created_at > $2
+       WHERE s.warehouse_id = $1 AND s.created_at > $2 AND NOT s.is_cancelled
        GROUP BY pm.name ORDER BY pm.name`,
       [warehouse_id || 1, since]
     );
 
-    const returnsRes = await pool.query(
-      `SELECT COALESCE(SUM(amount), 0) AS total FROM sale_returns WHERE warehouse_id = $1 AND created_at > $2`,
-      [warehouse_id || 1, since]
-    );
+   const returnsRes = await client.query(   // en /summary: pool.query
+  `SELECT COALESCE(SUM(r.amount), 0) AS total
+   FROM sale_returns r
+   JOIN sales s ON s.id = r.original_sale_id
+   WHERE r.warehouse_id = $1 AND r.created_at > $2
+     AND ( s.created_at <= $2
+           OR (r.return_type = 'partial' AND NOT s.is_cancelled) )`,
+  [warehouse_id || 1, since]
+);
     const returnsTotal = Number(returnsRes.rows[0].total);
 
     // Ventas por método (bruto). Las devoluciones se muestran aparte
@@ -1170,19 +1175,19 @@ app.get('/api/cash-cuts/summary', async (req, res) => {
 
     // Detalle de devoluciones del período (tickets afectados)
     const returnsList = await pool.query(
-      `SELECT sr.id, sr.original_sale_id, sr.amount, sr.reason, sr.created_at, u.name AS user_name,
-              COALESCE(
-                json_agg(json_build_object(
-                  'product_name', i.product_name, 'quantity', i.quantity,
-                  'amount', i.amount, 'restocked', i.restocked
-                )) FILTER (WHERE i.id IS NOT NULL), '[]'
-              ) AS items
-       FROM sale_returns sr
-       LEFT JOIN sale_return_items i ON i.return_id = sr.id
-       LEFT JOIN users u ON u.id = sr.user_id
-       WHERE sr.warehouse_id = $1 AND sr.created_at > $2
-       GROUP BY sr.id, u.name
-       ORDER BY sr.created_at`,
+     `SELECT sr.id, sr.original_sale_id, sr.amount, sr.reason, sr.created_at, u.name AS user_name,
+        COALESCE(json_agg(json_build_object(
+          'product_name', i.product_name, 'quantity', i.quantity,
+          'amount', i.amount, 'restocked', i.restocked
+        )) FILTER (WHERE i.id IS NOT NULL), '[]') AS items
+ FROM sale_returns sr
+ JOIN sales s ON s.id = sr.original_sale_id
+ LEFT JOIN sale_return_items i ON i.return_id = sr.id
+ LEFT JOIN users u ON u.id = sr.user_id
+ WHERE sr.warehouse_id = $1 AND sr.created_at > $2
+   AND ( s.created_at <= $2 OR (sr.return_type = 'partial' AND NOT s.is_cancelled) )
+ GROUP BY sr.id, u.name
+ ORDER BY sr.created_at`,
       [warehouse_id || 1, since]
     );
 
@@ -1271,7 +1276,7 @@ app.post('/api/cash-cuts', async (req, res) => {
 
     const salesRes = await client.query(
       `SELECT COALESCE(SUM(s.total), 0) AS sales_total
-       FROM sales s WHERE s.warehouse_id = $1 AND s.created_at > $2`,
+       FROM sales s WHERE s.warehouse_id = $1 AND s.created_at > $2 AND NOT s.is_cancelled`,
       [warehouse_id || 1, since]
     );
 
@@ -1280,7 +1285,7 @@ app.post('/api/cash-cuts', async (req, res) => {
        FROM sale_payments sp
        JOIN sales s ON s.id = sp.sale_id
        JOIN payment_methods pm ON pm.id = sp.payment_method_id
-       WHERE s.warehouse_id = $1 AND s.created_at > $2
+       WHERE s.warehouse_id = $1 AND s.created_at > $2 NOT s.is_cancelled 
        GROUP BY pm.name`,
       [warehouse_id || 1, since]
     );
@@ -1420,10 +1425,14 @@ app.get('/api/cash-cuts', async (req, res) => {
               cc.payments_breakdown, cc.manual_adjustments,
               u.name AS user_name,
               cs.opening_fund,
-              (SELECT COALESCE(SUM(r.amount), 0) FROM sale_returns r
+              (SELECT COALESCE(SUM(r.amount), 0)
+                 FROM sale_returns r
+                 JOIN sales s2 ON s2.id = r.original_sale_id
                 WHERE r.warehouse_id = cc.warehouse_id
                   AND r.created_at > cc.period_start
-                  AND r.created_at <= cc.period_end) AS returns_total
+                  AND r.created_at <= cc.period_end
+                  AND ( s2.created_at <= cc.period_start
+                        OR (r.return_type = 'partial' AND NOT s2.is_cancelled) )) AS returns_total
        FROM cash_cuts cc
        LEFT JOIN users u ON u.id = cc.user_id
        LEFT JOIN cash_shifts cs ON cs.id = cc.shift_id
@@ -1459,7 +1468,7 @@ app.get('/api/cash-cuts/summary/by-org', async (req, res) => {
       `SELECT o.id AS org_id, o.name AS org_name,
               COALESCE(SUM(s.total), 0) AS sales_total, COUNT(s.id) AS sale_count
        FROM organizations o
-       LEFT JOIN sales s ON s.org_id = o.id AND s.warehouse_id = $1 AND s.created_at > $2
+       LEFT JOIN sales s ON s.org_id = o.id AND s.warehouse_id = $1 AND s.created_at > $2 AND NOT s.is_cancelled
        WHERE o.is_active = TRUE
        GROUP BY o.id, o.name
        ORDER BY o.name`,
@@ -1471,7 +1480,7 @@ app.get('/api/cash-cuts/summary/by-org', async (req, res) => {
        FROM sale_payments sp
        JOIN sales s ON s.id = sp.sale_id
        JOIN payment_methods pm ON pm.id = sp.payment_method_id
-       WHERE s.warehouse_id = $1 AND s.created_at > $2
+       WHERE s.warehouse_id = $1 AND s.created_at > $2 AND NOT s.is_cancelled
        GROUP BY s.org_id, pm.name`,
       [warehouse_id || 1, since]
     );
@@ -1556,7 +1565,7 @@ app.get('/api/cash-cuts/:id/sales', async (req, res) => {
     const { warehouse_id, period_start, period_end } = cut.rows[0];
 
     const sales = await pool.query(
-      `SELECT s.id, s.org_id, o.name AS org_name, s.total, s.created_at,
+      `SELECT s.id, s.org_id, o.name AS org_name, s.total, s.created_at, s.is_cancelled 
               COALESCE(
                 json_agg(json_build_object('method_name', pm.name, 'amount', sp.amount))
                 FILTER (WHERE sp.id IS NOT NULL), '[]'
@@ -1587,7 +1596,7 @@ app.get('/api/cash-cuts/current-sales', async (req, res) => {
     const since = lastCut.rows[0]?.period_end || '1970-01-01';
 
     const sales = await pool.query(
-      `SELECT s.id, s.org_id, o.name AS org_name, s.total, s.created_at,
+      `SELECT s.id, s.org_id, o.name AS org_name, s.total, s.created_at, s.is_cancelled,
               COALESCE(
                 json_agg(json_build_object('method_name', pm.name, 'amount', sp.amount))
                 FILTER (WHERE sp.id IS NOT NULL), '[]'
