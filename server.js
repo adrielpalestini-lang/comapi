@@ -978,7 +978,7 @@ app.put('/api/organizations/:id/loyalty-settings', async (req, res) => {
 
 
 // ================= CORTE DE CAJA =================
-app.post('/api/cash-cuts', async (req, res) => {
+/*app.post('/api/cash-cuts', async (req, res) => {
   const {
     warehouse_id, user_id, counted_cash, denomination_breakdown, counted_methods,
     shift_id, fund_action, next_opening_fund, manual_adjustments,
@@ -1127,7 +1127,7 @@ app.post('/api/cash-cuts', async (req, res) => {
   } finally {
     client.release();
   }
-});
+});*/
 
 // Resumen desde el último corte (o desde siempre si no hay ninguno)
 app.get('/api/cash-cuts/summary', async (req, res) => {
