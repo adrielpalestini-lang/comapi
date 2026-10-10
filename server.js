@@ -2718,7 +2718,7 @@ app.get('/api/sales/search', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-
+ 
 app.get('/api/sales/:id/detail', async (req, res) => {
   const { id } = req.params;
   try {
