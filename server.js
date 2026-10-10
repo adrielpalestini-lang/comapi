@@ -1565,7 +1565,7 @@ app.get('/api/cash-cuts/:id/sales', async (req, res) => {
     const { warehouse_id, period_start, period_end } = cut.rows[0];
 
     const sales = await pool.query(
-      `SELECT s.id, s.org_id, o.name AS org_name, s.total, s.created_at, s.is_cancelled 
+      `SELECT s.id, s.org_id, o.name AS org_name, s.total, s.created_at, s.is_cancelled, 
               COALESCE(
                 json_agg(json_build_object('method_name', pm.name, 'amount', sp.amount))
                 FILTER (WHERE sp.id IS NOT NULL), '[]'
@@ -1596,7 +1596,7 @@ app.get('/api/cash-cuts/current-sales', async (req, res) => {
     const since = lastCut.rows[0]?.period_end || '1970-01-01';
 
     const sales = await pool.query(
-      `SELECT s.id, s.org_id, o.name AS org_name, s.total, s.created_at, s.is_cancelled,
+      `SELECT s.id, s.org_id, o.name AS org_name, s.total, s.created_at, s.is_cancelled, 
               COALESCE(
                 json_agg(json_build_object('method_name', pm.name, 'amount', sp.amount))
                 FILTER (WHERE sp.id IS NOT NULL), '[]'
