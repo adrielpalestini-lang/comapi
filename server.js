@@ -1957,6 +1957,83 @@ app.get('/api/reports/cafe-top-products', async (req, res) => {
   }
 });
 
+
+// Cambiar el fondo de un turno abierto, con motivo obligatorio y bitácora
+app.put('/api/cash-shifts/:id/fund', async (req, res) => {
+  const { id } = req.params;
+  const { new_fund, reason, user_id } = req.body;
+
+  const newFund = Number(new_fund);
+  if (!Number.isFinite(newFund) || newFund <= 0) {
+    return res.status(400).json({ error: 'El fondo debe ser un monto mayor a 0' });
+  }
+  if (!reason || !String(reason).trim()) {
+    return res.status(400).json({ error: 'El motivo es obligatorio' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const shiftRes = await client.query(
+      `SELECT id, warehouse_id, opening_fund, status FROM cash_shifts WHERE id = $1 FOR UPDATE`,
+      [id]
+    );
+    if (shiftRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Turno no encontrado' });
+    }
+    const shift = shiftRes.rows[0];
+    if (shift.status !== 'open') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Solo se puede cambiar el fondo de un turno abierto' });
+    }
+
+    const previousFund = Number(shift.opening_fund);
+    if (previousFund === newFund) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'El nuevo fondo es igual al actual' });
+    }
+
+    await client.query(`UPDATE cash_shifts SET opening_fund = $1 WHERE id = $2`, [newFund, id]);
+
+    await client.query(
+      `INSERT INTO cash_fund_adjustments
+       (shift_id, warehouse_id, previous_fund, new_fund, reason, user_id)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [id, shift.warehouse_id, previousFund, newFund, String(reason).trim(), user_id || null]
+    );
+
+    await client.query('COMMIT');
+    res.json({ success: true, previous_fund: previousFund, new_fund: newFund });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Historial de cambios de fondo de un turno
+app.get('/api/cash-shifts/:id/fund-adjustments', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT fa.id, fa.previous_fund, fa.new_fund, fa.reason, fa.created_at, u.name AS user_name
+       FROM cash_fund_adjustments fa
+       LEFT JOIN users u ON u.id = fa.user_id
+       WHERE fa.shift_id = $1
+       ORDER BY fa.created_at DESC`,
+      [req.params.id]
+    );
+    res.json(result.rows.map(r => ({
+      ...r,
+      previous_fund: Number(r.previous_fund),
+      new_fund: Number(r.new_fund),
+    })));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 // ================= PROMOCIONES =================
 
 app.get('/api/promotions', async (req, res) => {
