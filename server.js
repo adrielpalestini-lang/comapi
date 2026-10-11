@@ -1155,7 +1155,7 @@ app.get('/api/cash-cuts/summary', async (req, res) => {
       [warehouse_id || 1, since]
     );
 
-   const returnsRes = await client.query(   // en /summary: pool.query
+   const returnsRes = await pool.query(
   `SELECT COALESCE(SUM(r.amount), 0) AS total
    FROM sale_returns r
    JOIN sales s ON s.id = r.original_sale_id
