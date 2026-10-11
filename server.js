@@ -28,6 +28,8 @@ pool.on('error', (err) => {
   console.error('Error inesperado en el pool de Postgres:', err.message);
 });
 
+require('./admin-module')(app, { pool, jwt, JWT_SECRET });   // 👈 aquí
+
 // ================= HEALTH CHECK =================
 app.get('/api/health', async (req, res) => {
   try {
@@ -1285,13 +1287,18 @@ app.post('/api/cash-cuts', async (req, res) => {
        FROM sale_payments sp
        JOIN sales s ON s.id = sp.sale_id
        JOIN payment_methods pm ON pm.id = sp.payment_method_id
-       WHERE s.warehouse_id = $1 AND s.created_at > $2 NOT s.is_cancelled 
+       WHERE s.warehouse_id = $1 AND s.created_at > $2 AND NOT s.is_cancelled
        GROUP BY pm.name`,
       [warehouse_id || 1, since]
     );
 
     const returnsRes = await client.query(
-      `SELECT COALESCE(SUM(amount), 0) AS total FROM sale_returns WHERE warehouse_id = $1 AND created_at > $2`,
+      `SELECT COALESCE(SUM(r.amount), 0) AS total
+       FROM sale_returns r
+       JOIN sales s ON s.id = r.original_sale_id
+       WHERE r.warehouse_id = $1 AND r.created_at > $2
+         AND ( s.created_at <= $2
+               OR (r.return_type = 'partial' AND NOT s.is_cancelled) )`,
       [warehouse_id || 1, since]
     );
     const returnsTotal = Number(returnsRes.rows[0].total);
