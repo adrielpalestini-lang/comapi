@@ -1957,9 +1957,10 @@ app.get('/api/reports/sales-daily', async (req, res) => {
 // Ventas "en vivo": últimas N, o de las últimas X horas
 app.get('/api/reports/sales-live', async (req, res) => {
   const { warehouse_id, minutes = 240 } = req.query;
+  const wantsToday = String(minutes) === 'today';
   try {
-        const result = await pool.query(
-      `SELECT s.id, s.org_id, o.name AS org_name, s.total, s.created_at,
+    const result = await pool.query(
+      `SELECT s.id, s.org_id, o.name AS org_name, s.total, s.created_at, s.is_cancelled,
               u.name AS cashier_name,
               COALESCE(
                 json_agg(json_build_object('method_name', pm.name, 'amount', sp.amount))
@@ -1976,12 +1977,15 @@ app.get('/api/reports/sales-live', async (req, res) => {
           LIMIT 1)
        )
        WHERE s.warehouse_id = $1
-         AND s.created_at > NOW() - ($2 || ' minutes')::interval
+         AND s.created_at >= CASE
+               WHEN $2 THEN (date_trunc('day', NOW() AT TIME ZONE 'America/Mexico_City')
+                             AT TIME ZONE 'America/Mexico_City') AT TIME ZONE 'UTC'
+               ELSE NOW() - ($3 || ' minutes')::interval
+             END
        GROUP BY s.id, o.name, u.name
        ORDER BY s.created_at DESC
-       LIMIT 100`,
-      [warehouse_id || 1, minutes]
-  
+       LIMIT 500`,
+      [warehouse_id || 1, wantsToday, wantsToday ? '0' : String(minutes)]
     );
     res.json(result.rows.map(r => ({ ...r, total: Number(r.total) })));
   } catch (error) {
