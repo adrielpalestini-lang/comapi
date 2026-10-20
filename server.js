@@ -1414,7 +1414,141 @@ app.post('/api/cash-cuts', async (req, res) => {
   }
 });
 
+// Devolución parcial de un ticket (tienda y/o café)
+app.post('/api/sales/:id/return', async (req, res) => {
+  const saleId = Number(req.params.id);
+  const { warehouse_id, user_id, reason, items } = req.body;
 
+  if (!reason || !String(reason).trim())
+    return res.status(400).json({ error: 'El motivo es obligatorio' });
+  if (!Array.isArray(items) || items.length === 0)
+    return res.status(400).json({ error: 'No hay productos para devolver' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const saleRes = await client.query(
+      `SELECT id, org_id, warehouse_id, is_cancelled FROM sales WHERE id = $1 FOR UPDATE`,
+      [saleId]
+    );
+    if (saleRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Venta no encontrada' });
+    }
+    const sale = saleRes.rows[0];
+    if (sale.is_cancelled) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'La venta está cancelada, no admite devoluciones' });
+    }
+    const whId = warehouse_id || sale.warehouse_id || 1;
+
+    // 1) Validar y calcular cada línea
+    const lines = [];
+    for (const it of items) {
+      const qty = Number(it.quantity);
+      if (!(qty > 0)) throw new Error('Cantidad inválida');
+
+      if (it.sale_detail_id) {
+        const d = await client.query(
+          `SELECT sd.id, sd.product_id, sd.quantity, sd.unit_price, p.name
+           FROM sale_details sd JOIN products p ON p.id = sd.product_id
+           WHERE sd.id = $1 AND sd.sale_id = $2`,
+          [it.sale_detail_id, saleId]
+        );
+        if (d.rows.length === 0) throw new Error('Producto no pertenece a este ticket');
+        const r = await client.query(
+          `SELECT COALESCE(SUM(quantity),0) AS done FROM sale_return_items WHERE sale_detail_id = $1`,
+          [it.sale_detail_id]
+        );
+        const available = Number(d.rows[0].quantity) - Number(r.rows[0].done);
+        if (qty > available + 0.0001)
+          throw new Error(`"${d.rows[0].name}": solo quedan ${available} por devolver`);
+        lines.push({
+          type: 'store', detailId: d.rows[0].id, productId: d.rows[0].product_id,
+          name: d.rows[0].name, qty, unitPrice: Number(d.rows[0].unit_price),
+          restock: it.restock !== false,
+        });
+      } else if (it.cafe_sale_detail_id) {
+        // ⚠️ Ajusta los nombres de columna si cafe_sale_details usa otros
+        const d = await client.query(
+          `SELECT id, product_name AS name, quantity, unit_price
+           FROM cafe_sale_details WHERE id = $1 AND sale_id = $2`,
+          [it.cafe_sale_detail_id, saleId]
+        );
+        if (d.rows.length === 0) throw new Error('Producto de café no pertenece a este ticket');
+        const r = await client.query(
+          `SELECT COALESCE(SUM(quantity),0) AS done FROM sale_return_items WHERE cafe_sale_detail_id = $1`,
+          [it.cafe_sale_detail_id]
+        );
+        const available = Number(d.rows[0].quantity) - Number(r.rows[0].done);
+        if (qty > available + 0.0001)
+          throw new Error(`"${d.rows[0].name}": solo quedan ${available} por devolver`);
+        lines.push({
+          type: 'cafe', detailId: d.rows[0].id, name: d.rows[0].name,
+          qty, unitPrice: Number(d.rows[0].unit_price), restock: false,
+        });
+      } else {
+        throw new Error('Línea sin identificador de detalle');
+      }
+    }
+
+    const total = Number(lines.reduce((a, l) => a + l.unitPrice * l.qty, 0).toFixed(2));
+
+    // 2) Cabecera de la devolución
+    const retRes = await client.query(
+      `INSERT INTO sale_returns (original_sale_id, warehouse_id, amount, reason, user_id, return_type)
+       VALUES ($1,$2,$3,$4,$5,'partial') RETURNING id`,
+      [saleId, whId, total, String(reason).trim(), user_id || null]
+    );
+    const returnId = retRes.rows[0].id;
+
+    // 3) Detalle + inventario
+    for (const l of lines) {
+      const amount = Number((l.unitPrice * l.qty).toFixed(2));
+      await client.query(
+        `INSERT INTO sale_return_items
+         (return_id, sale_detail_id, cafe_sale_detail_id, product_name, quantity, unit_price, amount, restocked)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [returnId, l.type === 'store' ? l.detailId : null, l.type === 'cafe' ? l.detailId : null,
+         l.name, l.qty, l.unitPrice, amount, l.restock]
+      );
+
+      if (l.type === 'store' && l.restock) {
+        const invRes = await client.query(
+          `SELECT quantity FROM inventory WHERE org_id=$1 AND warehouse_id=$2 AND product_id=$3`,
+          [sale.org_id, whId, l.productId]
+        );
+        const before = parseFloat(invRes.rows[0]?.quantity || 0);
+        const after = before + l.qty;
+
+        await client.query(
+          `INSERT INTO inventory (org_id, warehouse_id, product_id, quantity)
+           VALUES ($1,$2,$3,$4)
+           ON CONFLICT (org_id, warehouse_id, product_id)
+           DO UPDATE SET quantity = $4, last_update = NOW()`,
+          [sale.org_id, whId, l.productId, after]
+        );
+        await client.query(
+          `INSERT INTO inventory_movements
+           (org_id, warehouse_id, product_id, movement_type, quantity,
+            quantity_before, quantity_after, unit_cost, reference_type, reference_id, user_id, notes)
+           VALUES ($1,$2,$3,'devolucion',$4,$5,$6,$7,'return',$8,$9,$10)`,
+          [sale.org_id, whId, l.productId, l.qty, before, after, l.unitPrice,
+           returnId, user_id || null, String(reason).trim()]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+    res.json({ success: true, returnId, amount: total });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
 
 
 // Historial de cortes ya realizados
